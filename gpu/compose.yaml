@@ -1,0 +1,111 @@
+services:
+  # Front door. nginx + njs in one service: njs is an nginx module, so the
+  # upload handler and the reverse proxy are the same process.
+  #
+  #   /          llama.cpp's WebUI and API, proxied to glm53f below
+  #   /manage/          the file manager page: list, upload, download
+  #   /manage/upload    PUT a raw body:  curl -T x.zip '.../manage/upload?name=x.zip'
+  #   /manage/files     JSON listing of the shared volume
+  #   /manage/download/ read a file back out
+  #
+  # This is what publishes 8080 now. glm53f keeps its port inside the network.
+  gateway:
+    image: ghcr.io/onixldlc/glm53f-server:gateway
+    pull_policy: always
+    container_name: glm53f-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      # Shared with glm53f below, where it is the server's working directory.
+      # That is what makes a path from /files usable by the model unchanged.
+      - glm53f-workspace:/workspace
+    environment:
+      # Compose resolves the service name on this network.
+      UPSTREAM: glm53f:8080
+      LISTEN_PORT: 8080
+      DATA_DIR: /workspace
+      # Empty disables the check. Reaching this port already means an SSH
+      # tunnel, so a second secret is optional — set it to require the token.
+      UPLOAD_TOKEN: ${UPLOAD_TOKEN:-}
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-8g}
+    # Deliberately service_started, not service_healthy: the model server spends
+    # a long time on weights — a first run downloads 87-272 GiB and then reads it
+    # all back off disk — and everything under /manage/ should answer throughout.
+    # Only / returns 502 until the upstream is up.
+    depends_on:
+      glm53f:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      # The gateway's own liveness, not the model's — no upstream involved.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/manage/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  glm53f:
+    # The published image. :gpu is the newest CUDA build; pin :vX.Y.Z-gpu if you
+    # want a fixed one. https://github.com/onixldlc/glm53f-server/pkgs/container/glm53f-server
+    #
+    # To build from this checkout instead — which is what you want if you are
+    # editing docker/ — add the dev override:
+    #   podman compose -f compose.yaml -f compose-dev.yaml up -d --build
+    image: ghcr.io/onixldlc/glm53f-server:gpu
+    pull_policy: always
+    container_name: glm53f
+    # No ports: gateway publishes 8080 and proxies here. Uncomment to reach
+    # llama-server directly as well, bypassing the gateway:
+    # ports:
+    #   - "8081:8080"
+    volumes:
+      # Named volume: weights survive `compose down` and re-`up`. Holds .gguf only.
+      - glm53f-models:/models
+      # The uploads volume, and the server's working directory. The built-in file
+      # tools in EXTRA_ARGS resolve relative paths against it, so whatever the
+      # gateway drops in here is readable by the model with no extra wiring.
+      - glm53f-workspace:/workspace
+      # To work on a project from the host instead of uploaded files, mount it
+      # over the same path — note this HIDES the uploads volume:
+      # - ./workspace:/workspace:z
+    # Compose auto-reads ./.env only to expand ${VAR} inside this file.
+    # Putting those vars INSIDE the container needs this line.
+    env_file:
+      - .env
+    # EVERY card, not one. No single GPU holds this model: the smallest quant is
+    # 86.69 GiB, so a working host is at least 3x 5090 or 2x A100-80, and
+    # autoscale.sh sums the per-card totals because llama.cpp splits layers over
+    # all visible devices. Handing it one device would drop it to the floor tier.
+    #
+    # To pin a subset instead, list them — indices, or UUID names if indices shift:
+    #   devices:
+    #     - nvidia.com/gpu=0
+    #     - nvidia.com/gpu=1
+    #   nvidia.com/gpu=GPU-eee1bf52-918c-4f2d-2898-7af735f2a8c8
+    devices:
+      - nvidia.com/gpu=all
+    # SELinux on Bazzite blocks the nvidia device nodes otherwise.
+    security_opt:
+      - label=disable
+    # Docker / older podman instead of the `devices` line above:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           device_ids: ["0"]
+    #           capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # First run is download + load, not just load: 112 GiB at 1 Gbit is ~16
+      # minutes of transfer before llama.cpp even starts reading. Measured load
+      # alone, once the shards are in the volume, is single-digit minutes.
+      start_period: 90m
+
+volumes:
+  glm53f-models:
+  glm53f-workspace:
