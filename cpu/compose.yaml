@@ -1,47 +1,17 @@
 services:
-  # Front door. nginx + njs in one service: njs is an nginx module, so the
-  # upload handler and the reverse proxy are the same process.
+  # One service, one image. nginx + njs and llama-server run side by side in it:
   #
-  #   /          llama.cpp's WebUI and API, proxied to glm53f below
-  #   /manage/          the file manager page: list, upload, download
-  #   /manage/upload    PUT a raw body:  curl -T x.zip '.../manage/upload?name=x.zip'
-  #   /manage/files     JSON listing of the shared volume
-  #   /manage/download/ read a file back out
+  #   :8080  nginx           the only published port
+  #     /                    llama.cpp's WebUI and API, proxied to 127.0.0.1:8081
+  #     /manage/             the file manager page: list, upload, download
+  #     /manage/upload       PUT a raw body:  curl -T x.zip '.../manage/upload?name=x.zip'
+  #     /manage/files        JSON listing of the uploads volume
+  #     /manage/download/    read a file back out
+  #     /manage/health       nginx's own liveness, no upstream involved
   #
-  # This is what publishes 8080 now. glm53f keeps its port inside the network.
-  gateway:
-    image: ghcr.io/onixldlc/glm53f-server:gateway
-    pull_policy: always
-    container_name: glm53f-gateway-cpu
-    ports:
-      - "8080:8080"
-    volumes:
-      # Shared with glm53f below, where it is the server's working directory.
-      # That is what makes a path from /files usable by the model unchanged.
-      - glm53f-workspace:/workspace
-    environment:
-      UPSTREAM: glm53f:8080
-      LISTEN_PORT: 8080
-      DATA_DIR: /workspace
-      # Empty disables the check. Reaching this port already means an SSH
-      # tunnel, so a second secret is optional — set it to require the token.
-      UPLOAD_TOKEN: ${UPLOAD_TOKEN:-}
-      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-8g}
-    # Deliberately service_started, not service_healthy: on CPU the model server
-    # spends even longer loading, and everything under /manage/ should answer
-    # throughout. Only / returns 502 until the upstream is up.
-    depends_on:
-      glm53f:
-        condition: service_started
-    restart: unless-stopped
-    healthcheck:
-      # The gateway's own liveness, not the model's — no upstream involved.
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/manage/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
+  # nginx starts first and llama-server after, so /manage/ answers throughout a
+  # first run's download and load — which on CPU is the longer wait of the two.
+  # / is 502 until the model is up.
   glm53f:
     # The published image. :cpu is the newest CPU-only build; pin :vX.Y.Z-cpu if
     # you want a fixed one. https://github.com/onixldlc/glm53f-server/pkgs/container/glm53f-server
@@ -52,15 +22,14 @@ services:
     image: ghcr.io/onixldlc/glm53f-server:cpu
     pull_policy: always
     container_name: glm53f-cpu
-    # No ports: gateway publishes 8080 and proxies here. Uncomment to reach
-    # llama-server directly as well, bypassing the gateway:
-    # ports:
-    #   - "8081:8080"
+    ports:
+      - "8080:8080"
     volumes:
       - glm53f-models:/models
-      # The uploads volume, and the server's working directory. The built-in file
-      # tools in EXTRA_ARGS resolve relative paths against it, so whatever the
-      # gateway drops in here is readable by the model with no extra wiring.
+      # The uploads volume, and the server's working directory. nginx writes
+      # uploads here and the built-in file tools in EXTRA_ARGS resolve relative
+      # paths against it, so whatever is dropped in is readable by the model
+      # with no extra wiring.
       - glm53f-workspace:/workspace
       # To work on a project from the host instead of uploaded files, mount it
       # over the same path — note this HIDES the uploads volume:
@@ -69,6 +38,11 @@ services:
     # Putting those vars INSIDE the container needs this line.
     env_file:
       - .env
+    environment:
+      # Empty disables the check. Reaching 8080 already means an SSH tunnel, so
+      # a second secret is optional — set it to require X-Upload-Token.
+      UPLOAD_TOKEN: ${UPLOAD_TOKEN:-}
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-8g}
     # CFS quota, not a core count: 3.0 = three cores' worth of CPU time per
     # period = 50% of a 6 vCPU box. Set CPU_LIMIT in .env.
     cpus: ${CPU_LIMIT}
@@ -80,6 +54,9 @@ services:
     mem_limit: ${MEM_LIMIT}
     restart: unless-stopped
     healthcheck:
+      # llama.cpp's /health through nginx: this is the MODEL's readiness, which
+      # is what "healthy" should mean. For nginx alone, /manage/health answers
+      # within seconds of start.
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s

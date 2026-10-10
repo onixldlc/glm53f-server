@@ -13,7 +13,7 @@
 # answer exactly that, and every path they return is relative to WORKSPACE, so it
 # can be passed to read_file verbatim with no rewriting.
 #
-# The gateway writes to the same volume, so this reads the filesystem directly
+# nginx writes uploads to this same directory, so this reads the filesystem directly
 # rather than calling nginx: same bytes, no network hop, no token in the path.
 #
 # stdout is the protocol. Every diagnostic goes to stderr or it corrupts the

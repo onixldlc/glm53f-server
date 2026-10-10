@@ -17,9 +17,3 @@ services:
       dockerfile: docker/Dockerfile
       # GPU is the Dockerfile's default: CUDA base, ubuntu-cuda-12.8-x64 asset.
 
-  gateway:
-    image: localhost/glm53f-server:dev-gateway
-    pull_policy: never
-    build:
-      context: ..
-      dockerfile: docker/gateway/Dockerfile

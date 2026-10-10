@@ -1,32 +1,37 @@
-# Single front door for the glm53f stack. The double-underscore delimited names
-# below are rendered by docker/gateway/entrypoint.sh into an ephemeral file at
-# start, so the template is what gets mounted and reviewed while the resolved
-# config never lands on disk. Nothing else in this file may use that spelling:
-# the entrypoint greps for leftovers and refuses to start if it finds any.
+# Single front door for the glm53f image. The double-underscore delimited names
+# below are rendered by docker/gateway.sh into an ephemeral file at start, so the
+# template is what gets mounted and reviewed while the resolved config never
+# lands on disk. Nothing else in this file may use that spelling: gateway.sh
+# greps for leftovers and refuses to start if it finds any.
 #
-# EVERYTHING this image serves lives under /manage/ — the page and the endpoints
-# it calls are one namespace:
+# nginx and llama-server share one container. nginx owns the published port and
+# llama-server binds loopback behind it, so __UPSTREAM__ is 127.0.0.1:8081 and
+# not a service name on a compose network.
+#
+# EVERYTHING this proxy serves itself lives under /manage/ — the page and the
+# endpoints it calls are one namespace:
 #
 #   /manage/                the file manager page
 #   /manage/files           JSON listing       (the page, and anything scripted)
 #   /manage/upload          PUT a raw body
 #   /manage/remove          DELETE one upload
 #   /manage/download/<path> read a file back out (token-gated, then internal)
-#   /manage/health          this container's liveness, no upstream involved
+#   /manage/health          nginx liveness, no upstream involved
 #
 # Everything OUTSIDE /manage/ is llama.cpp, proxied. Keeping one prefix means the
-# upstream can grow any route it likes without colliding with this image, and the
-# UI and the scriptable API are the same endpoints rather than two surfaces.
+# upstream can grow any route it likes without colliding with this config, and
+# the UI and the scriptable API are the same endpoints rather than two surfaces.
 #
 # The njs module is a DYNAMIC module and only loads into the exact nginx build it
-# was compiled against. Both come from Alpine main at the same -r revision, and
-# the path below is from the package file list rather than an include, so a
-# missing module fails loudly at startup instead of silently skipping routes.
-load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
+# was compiled against. Both come from the Ubuntu archive as nginx-core and
+# libnginx-mod-http-js at one version, and the path is rendered rather than
+# included, so a missing or mismatched module fails `nginx -t` at startup
+# instead of silently skipping every route above.
+load_module __NJS_MODULE__;
 
-# Uploads land on a volume shared with the model server, which runs as root and
-# so owns everything it writes there. A worker running as nginx:nginx could not
-# write alongside it. This container does nothing but move files on that volume.
+# llama-server runs as root in this image and owns everything it writes to the
+# uploads volume. A worker running as nginx:nginx could not write alongside it,
+# and these workers do nothing but move files on that volume.
 user root;
 worker_processes auto;
 pid /run/nginx.pid;
@@ -82,8 +87,9 @@ http {
         # An exact match wins over every prefix below, so the order of these
         # blocks does not matter to nginx — they are grouped for reading.
 
-        # This container's own liveness. Deliberately not proxied: it has to
-        # answer while the model server is still loading 18 GB of weights.
+        # nginx's own liveness. Deliberately not proxied: it has to answer
+        # while llama-server is still fetching and loading 87-272 GiB of
+        # weights, which is the whole reason nginx starts first.
         location = /manage/health {
             access_log off;
             default_type text/plain;

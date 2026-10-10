@@ -23,7 +23,13 @@ RUN apt-get update
 
 RUN apt-get install -y --no-install-recommends ca-certificates curl tar libgomp1 libcurl4 jq unzip zstd
 
+RUN apt-get install -y --no-install-recommends nginx libnginx-mod-http-js
+
 RUN rm -rf /var/lib/apt/lists/*
+
+RUN nginx -v
+
+RUN test -f /usr/lib/nginx/modules/ngx_http_js_module.so
 
 WORKDIR /app
 
@@ -51,7 +57,17 @@ COPY docker/mcp-files.sh /usr/local/bin/mcp-files
 
 COPY docker/mcp.json.template /etc/glm53f/mcp.json.template
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify.sh /usr/local/bin/autoscale.sh /usr/local/bin/mcp-web /usr/local/bin/mcp-files
+# The front door's own files. nginx.conf.template is rendered by gateway.sh the
+# same way mcp.json.template is rendered by the entrypoint.
+COPY docker/gateway.sh /usr/local/bin/gateway.sh
+
+COPY docker/gateway/nginx.conf.template /etc/glm53f/nginx.conf.template
+
+COPY docker/gateway/upload.js /etc/glm53f/njs/upload.js
+
+COPY docker/gateway/index.html /usr/share/nginx/html/manage/index.html
+
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify.sh /usr/local/bin/autoscale.sh /usr/local/bin/gateway.sh /usr/local/bin/mcp-web /usr/local/bin/mcp-files
 
 # The release tarball carries its own shared objects next to the binaries.
 ENV LD_LIBRARY_PATH=/app/bin:/usr/local/cuda/lib64
@@ -86,8 +102,22 @@ ENV N_GPU_LAYERS=99
 ENV THREADS=
 ENV THREADS_BATCH=
 ENV FLASH_ATTN=on
-ENV HOST=0.0.0.0
-ENV PORT=8080
+# 1 = nginx comes up first on LISTEN_PORT and llama-server binds HOST:PORT
+# behind it; that is what publishes 8080 and what serves /manage/. 0 = no proxy,
+# no /manage/, and llama-server is the only thing listening — set HOST=0.0.0.0
+# and PORT=8080 yourself if you turn it off.
+ENV GATEWAY_ENABLE=1
+# What nginx publishes.
+ENV LISTEN_PORT=8080
+# Where llama-server listens. Loopback, because nginx proxies to it from inside
+# the same container; 8081 because nginx has 8080.
+ENV HOST=127.0.0.1
+ENV PORT=8081
+# Empty disables the upload check. Reaching the published port already means an
+# SSH tunnel, so a second secret is optional — set it to require X-Upload-Token.
+ENV UPLOAD_TOKEN=
+ENV MAX_UPLOAD_SIZE=8g
+ENV ERROR_LEVEL=warn
 ENV DOWNLOAD_ATTEMPTS=20
 ENV EXTRA_ARGS=
 # Tool servers, off by default. 1 renders the MCP config and hands llama-server
@@ -104,7 +134,8 @@ ENV SEARXNG_URL=
 ENV SEARCH_RESULTS=8
 ENV FETCH_MAX_CHARS=20000
 ENV HTTP_TIMEOUT=20
-# The uploads volume, shared with the gateway. This is also WORKDIR below, so a
+# The uploads volume, which nginx writes to and the model reads. Also WORKDIR
+# below, so a
 # path mcp-files reports is already relative to what the built-in file tools
 # resolve against — that is the whole trick, and changing one without the other
 # breaks it.
@@ -116,6 +147,7 @@ ENV EXTRACT_SUBDIR=extracted
 ENV UPLOADS_MAX_DEPTH=12
 ENV UPLOADS_MAX_ENTRIES=400
 
+# nginx. llama-server's 8081 stays inside the container.
 EXPOSE 8080
 
 VOLUME ["/models"]

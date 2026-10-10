@@ -11,6 +11,19 @@ log() { printf '[glm53f] %s\n' "$*"; }
 MODEL_DIR="${MODEL_DIR:-/models}"
 mkdir -p "$MODEL_DIR"
 
+# --- front door -------------------------------------------------------------
+# nginx first, llama-server second, both in this container. nginx publishes
+# LISTEN_PORT (8080) and proxies to llama-server on 127.0.0.1:PORT (8081), so
+# /manage/ answers for the whole of a first run's 87-272 GiB download while /
+# returns 502 until the model is actually up. It is daemonised, so the container
+# still lives and dies with llama-server below.
+if [ "${GATEWAY_ENABLE:-1}" = "1" ]; then
+    /usr/local/bin/gateway.sh start
+else
+    log "gateway disabled: llama-server is the only listener, on ${HOST}:${PORT}"
+    log "  nothing serves /manage/ — set HOST=0.0.0.0 PORT=8080 to publish it directly"
+fi
+
 # --- VRAM autoscaling -------------------------------------------------------
 # AUTO_SCALE=1 asks autoscale.sh which quant, context and KV type suit the card
 # in front of us. The decision happens here, before anything is downloaded,
@@ -223,8 +236,9 @@ if [ "${MCP_ENABLE:-0}" = "1" ]; then
     fi
 fi
 
-# The gateway writes here and the built-in file tools read from here. Creating
-# them up front means an empty volume still lists cleanly instead of erroring.
+# nginx writes here and the built-in file tools read from here. gateway.sh makes
+# these too; repeated for GATEWAY_ENABLE=0, where an empty volume should still
+# list cleanly instead of erroring.
 mkdir -p "${UPLOADS_WORKSPACE:-/workspace}/${INBOX_SUBDIR:-inbox}" \
          "${UPLOADS_WORKSPACE:-/workspace}/${EXTRACT_SUBDIR:-extracted}" 2>/dev/null || true
 

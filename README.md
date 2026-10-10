@@ -33,12 +33,12 @@ Links: [weights on HuggingFace](https://huggingface.co/unsloth/GLM-5.3-Flash-GGU
 ## Layout
 
 ```
-docker/        Dockerfile + entrypoint.sh + verify.sh + mcp-web.sh + mcp-files.sh
-docker/gateway/  nginx + njs front door: Dockerfile, nginx.conf.template, upload.js
+docker/        Dockerfile + entrypoint.sh + verify.sh + gateway.sh + mcp-web.sh + mcp-files.sh
+docker/gateway/  front door assets: nginx.conf.template, upload.js, index.html
 gpu/           compose.yaml + compose-dev.yaml + .env  — CUDA
 cpu/           compose.yaml + compose-dev.yaml + .env  — CPU-only, for a VPS
 VERSION        the release number; changing it is what triggers a publish
-.github/       workflow that builds all three images and pushes them to GHCR
+.github/       workflow that builds both images and pushes them to GHCR
 ```
 
 `compose.yaml` pulls the published image — `:gpu` or `:cpu` — so a plain `up` downloads a
@@ -75,7 +75,6 @@ Skip the build and pull from GHCR. One image name, the variant is the tag:
 
 | Tag | What it is |
 |---|---|
-| `ghcr.io/onixldlc/glm53f-server:gateway` | newest nginx + njs front door — rolling |
 | `ghcr.io/onixldlc/glm53f-server:gpu` | newest CUDA build — rolling |
 | `ghcr.io/onixldlc/glm53f-server:cpu` | newest CPU-only build — rolling |
 | `ghcr.io/onixldlc/glm53f-server:v0.1.0-gpu` | that release's CUDA build — pinned |
@@ -120,15 +119,22 @@ Note that an **absolute** path is passed through unchanged
 ([`server-tools.cpp:162`](https://github.com/ggml-org/llama.cpp/blob/b11461/tools/server/server-tools.cpp#L162)) —
 `/workspace` is a default, not a jail. The tools can reach anything the container can.
 
-## Uploads and the gateway
+## Uploads and the front door
 
 The agent tools above can read anything on `/workspace`, but only once the model knows the
 path. Nothing tells it that a zip arrived, where it landed, or what is inside. That is the
-gap the gateway and the `uploads_*` tools close.
+gap the front door and the `uploads_*` tools close.
 
-**One port, two things behind it.** `gateway` is the service that publishes `8080`;
-`llama-server` keeps its port inside the compose network and is proxied. Everything this
-image serves lives under `/manage/`, and everything outside it is llama.cpp:
+**One image, one port, two processes.** nginx runs **inside** this image, next to
+`llama-server`: nginx owns the published `8080` and `llama-server` binds `127.0.0.1:8081`
+behind it. There is no gateway image, no second service and no compose network between the
+two — `docker/gateway.sh` renders the config and starts nginx, then `entrypoint.sh` goes on
+to fetch weights and `exec`s `llama-server` as the container's main process. nginx is
+started first and daemonised, so `/manage/` answers for the whole of a first run's download
+while the container still lives and dies with the model.
+
+Everything nginx serves itself lives under `/manage/`, and everything outside it is
+llama.cpp:
 
 ```
 :8080/manage/                the file manager page
@@ -136,7 +142,7 @@ image serves lives under `/manage/`, and everything outside it is llama.cpp:
 :8080/manage/upload          PUT a raw body     ?name=
 :8080/manage/remove          DELETE one upload  ?name=
 :8080/manage/download/<path> read a file back out
-:8080/manage/health          gateway liveness, no upstream involved
+:8080/manage/health          nginx liveness, no upstream involved
 
 :8080/                       llama.cpp's WebUI and API (/v1/*, /health, /props, ...)
 ```
@@ -150,11 +156,12 @@ same call.
 The single prefix is also why the upstream can grow any route it likes without colliding
 with this image.
 
-nginx and njs are **one** service, not two: njs is an nginx module, so the upload handler and
-the reverse proxy are the same process. The image is `alpine` plus the distro `nginx` and
-`nginx-mod-http-js`, deliberately not `nginx:alpine` — `ngx_http_js_module` is a dynamic
-module and only loads into the exact nginx build it was compiled against, and Alpine main
-ships the pair at a matching `-r` revision.
+njs is an nginx **module**, so the upload handler and the reverse proxy are the same process
+— there is nothing here to supervise. `ngx_http_js_module` is a *dynamic* module and only
+loads into the exact nginx build it was compiled against, which is why the packages come from
+the Ubuntu archive the image is already built on: `nginx` 1.24.0 and `libnginx-mod-http-js`
+0.8.2 resolve together, and `gateway.sh` runs `nginx -t` at startup so a mismatch fails
+loudly instead of silently skipping every route above.
 
 Uploads are a **raw body, never multipart**. nginx buffers the body to a temp file on the same
 filesystem as the destination and `upload.js` renames it into place, so a multi-gigabyte zip
@@ -173,9 +180,9 @@ curl -T report.zip 'http://127.0.0.1:8080/manage/upload?name=report.zip'
 }
 ```
 
-**`workspace_path` is the point.** The gateway writes to the volume that is also
-`llama-server`'s working directory, so a path reported here is already relative to what the
-built-in file tools resolve against. Nothing translates paths between the two halves, because
+**`workspace_path` is the point.** nginx writes to the volume that is also
+`llama-server`'s working directory — the same directory, in the same container — so a path
+reported here is already relative to what the built-in file tools resolve against. Nothing translates paths between the two halves, because
 there is nothing to translate.
 
 ### Scripting it
@@ -250,18 +257,18 @@ listing and upload still honoured the token.
 ### One wrinkle: uploaded files are mode 0600
 
 An upload inherits the mode of the nginx body temp file it was renamed from, which is `0600`
-owned by the gateway worker. Both containers run as root by default, so the model reads them
-fine. It only bites if you change either container to a non-root user — njs has no `chmod`,
-so there is nothing in `upload.js` that could widen it. Run both as the same uid if you move
-off root.
+owned by the nginx worker. Both nginx and `llama-server` run as root in this image, so the
+model reads them fine. It only bites if you move either off root — njs has no `chmod`, so
+there is nothing in `upload.js` that could widen it. Run both as the same uid if you do.
 
-### One ordering constraint
+### Start order, and why it is no longer a constraint
 
-nginx resolves an upstream server name when it **parses** its config, not per request, so the
-gateway cannot start before `glm53f` resolves on the compose network. That is why
-`depends_on` is present and set to `service_started` — not `service_healthy`, because the
-model server spends up to 15 minutes loading weights and everything under `/manage/` should
-answer throughout. Only `/` returns 502 until the upstream is up.
+nginx resolves an upstream server name when it **parses** its config, not per request. With a
+gateway container that meant it could not start before `glm53f` resolved on the compose
+network, and a `depends_on: service_started` to say so. In one container the upstream is
+`127.0.0.1:8081`, a literal that always parses, so nginx starts unconditionally and starts
+*first*: `/manage/` answers from a few seconds in, through the whole 87-272 GiB download and
+load, and only `/` returns 502 until `llama-server` is listening.
 
 ## Web tools
 
@@ -312,19 +319,24 @@ Worth knowing before you turn it on:
 
 > `.github/workflows/build.yml` is **not in this repo yet**. `.github/workflows/` holds only a
 > `.temp` placeholder so the folder exists; add `build.yml` from the GitHub web editor ("Add
-> file" inside that folder prefills the path), then delete the placeholder. Copy it from
-> [`qwen38-server`](https://github.com/onixldlc/qwen38-server/blob/main/.github/workflows/build.yml)
-> and change the image name — pushing workflow files needs a PAT with the `workflow` scope.
+> file" inside that folder prefills the path), then delete the placeholder. The content to
+> paste is in this checkout at `.github/workflows/build.yml`, which is deliberately untracked
+> — pushing workflow files needs a PAT with the `workflow` scope. It is *not* interchangeable
+> with [`qwen38-server`](https://github.com/onixldlc/qwen38-server/blob/main/.github/workflows/build.yml)'s
+> copy any more: that one still builds a separate gateway image, which this stack does not have.
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds the `gpu` and `cpu`
-variants in a matrix off the one Dockerfile, builds the `gateway` image from
-`docker/gateway/Dockerfile` in a job of its own, and pushes all three to GHCR.
+variants in a matrix off the one Dockerfile and pushes both to GHCR. There is no third job:
+the front door is part of these images, so it is built and tested with them.
 
-The gateway's smoke test starts the real entrypoint and drives the njs handlers over HTTP —
+Each variant gets two smoke tests. The first checks the binaries. The second starts the
+**same image** with `--entrypoint /usr/local/bin/gateway.sh ... foreground`, which brings up
+nginx with no model and no download in front of it, and drives the njs handlers over HTTP —
 `/manage/health`, `/manage/files`, a full upload round trip, the same file back out through
-`/manage/download/`, a refused traversing filename and the page itself. That is the only
-check that proves the dynamic module actually loaded into that nginx build. It overrides `UPSTREAM` to `127.0.0.1:9`, because nginx resolves an upstream name when
-it parses the config and the default `glm53f` does not exist on a runner.
+`/manage/download/`, a refused traversing filename, the page itself, and finally that the
+upload really landed in `/workspace`, the model's working directory. That is the only check
+that proves the dynamic module actually loaded into that nginx build. It overrides `UPSTREAM`
+to `127.0.0.1:9` because nothing in the test requests a proxied path.
 
 **The `VERSION` file is the trigger.** The workflow runs only on a push to `main` that
 changes that file — any other commit costs zero Actions minutes. So a release is one edit,
@@ -335,7 +347,6 @@ no credentialed machine.
 VERSION: 0.1.0 -> 0.2.0        commit to main
   => ghcr.io/onixldlc/glm53f-server:v0.2.0-gpu       (pinned)
      ghcr.io/onixldlc/glm53f-server:v0.2.0-cpu       (pinned)
-     ghcr.io/onixldlc/glm53f-server:v0.2.0-gateway   (pinned)
      ghcr.io/onixldlc/glm53f-server:gpu          (moved to this build)
      ghcr.io/onixldlc/glm53f-server:cpu          (moved to this build)
 ```
@@ -492,7 +503,7 @@ unquantized in every one of these, which is already counted in the weight totals
 
 ```bash
 cp .env.example .env     # pick MODEL_FILE + CTX_SIZE for your host
-podman compose up -d     # starts glm53f AND the gateway in front of it
+podman compose up -d     # one container: nginx on 8080, llama-server behind it
 podman logs -f glm53f    # first start downloads 112 GiB into the glm53f-models volume
 curl localhost:8080/v1/models
 ```
@@ -502,10 +513,11 @@ transfer before llama.cpp starts reading anything, which is why the healthcheck'
 `start_period` is 90m on the GPU stack. On a rented box, pull the weights onto a persistent
 volume once and keep it.
 
-`8080` is the **gateway**; `llama-server` is proxied behind it and publishes no port of its
-own. The chat UI is still at `/`, and `/manage/` is the file manager. To reach `llama-server`
-directly as well, uncomment its `ports:` block in `compose.yaml` — it maps to `8081` so the
-two do not collide.
+`8080` is **nginx**; `llama-server` listens on `127.0.0.1:8081` inside the container and is
+proxied. The chat UI is still at `/`, and `/manage/` is the file manager. To reach
+`llama-server` without the proxy, publish its port too (`-p 8081:8081` with `HOST=0.0.0.0`),
+or set `GATEWAY_ENABLE=0` with `HOST=0.0.0.0 PORT=8080` to drop nginx entirely — which also
+drops `/manage/`.
 
 Plain podman:
 
@@ -518,8 +530,10 @@ podman run --rm --name glm53f \
   ghcr.io/onixldlc/glm53f-server:gpu
 ```
 
-That form skips the gateway, so there is no upload page — fine when you only want the API.
-The `uploads_*` tools still work against whatever is on `/workspace`.
+That form has the upload page too: nginx is in the image, so a plain `podman run` publishing
+`8080` serves `/manage/` and proxies `/` with nothing extra to start. Add
+`-e GATEWAY_ENABLE=0 -e HOST=0.0.0.0 -e PORT=8080` if you want `llama-server` alone on the
+port; the `uploads_*` tools still work against whatever is on `/workspace` either way.
 
 **`nvidia.com/gpu=all`, not `=0`.** No single card holds this model, so handing the container
 one device drops it to the floor tier and spills layers to host RAM. `nvidia-ctk cdi list`
@@ -528,12 +542,11 @@ prints the valid names if you want to pin a subset.
 Building them yourself instead:
 
 ```bash
-podman build -t glm53f-server:dev         -f docker/Dockerfile .
-podman build -t glm53f-server:dev-gateway -f docker/gateway/Dockerfile .
+podman build -t glm53f-server:dev -f docker/Dockerfile .
 ```
 
-Both take the repo root as context, which is why the `-f` path is `docker/...` rather than a
-`cd` into it. To build against a newer llama.cpp than the pinned `b11461`:
+One image, nginx included. It takes the repo root as context, which is why the `-f` path is
+`docker/...` rather than a `cd` into it. To build against a newer llama.cpp than the pinned `b11461`:
 
 ```bash
 podman build --build-arg LLAMA_TAG=bNNNNN -f docker/Dockerfile .

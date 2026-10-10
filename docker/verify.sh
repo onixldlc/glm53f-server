@@ -127,14 +127,19 @@ else
     fi
 fi
 
-printf 'gateway\n'
-if curl -fsS --max-time 5 "http://gateway:8080/manage/health" >/dev/null 2>&1; then
-    ok "gateway answers on the compose network"
-    curl -fsS --max-time 5 "http://gateway:8080/manage/files?path=&depth=1" | head -c 300; echo
+printf 'front door\n'
+# nginx is in THIS container, on LISTEN_PORT, with llama-server behind it on
+# PORT. No compose network involved.
+GW_PORT="${LISTEN_PORT:-8080}"
+if [ "${GATEWAY_ENABLE:-1}" != "1" ]; then
+    ok "GATEWAY_ENABLE=0, nothing serves /manage/ by design"
+elif ! pgrep -x nginx >/dev/null 2>&1; then
+    fail "GATEWAY_ENABLE=1 but no nginx process"
+elif curl -fsS --max-time 5 "http://127.0.0.1:${GW_PORT}/manage/health" >/dev/null 2>&1; then
+    ok "nginx answers on 127.0.0.1:${GW_PORT}"
+    curl -fsS --max-time 5 "http://127.0.0.1:${GW_PORT}/manage/files?path=&depth=1" | head -c 300; echo
 else
-    # Not a failure: glm53f runs standalone perfectly well, it just has no
-    # upload page in front of it.
-    ok "gateway not reachable by name (expected if running glm53f on its own)"
+    fail "nginx is running but /manage/health does not answer on ${GW_PORT}"
 fi
 
 printf 'http\n'

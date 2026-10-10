@@ -20,10 +20,3 @@ services:
         BASE_IMAGE: docker.io/library/ubuntu:24.04
         LLAMA_FLAVOR: ubuntu-x64
 
-  gateway:
-    # Same gateway either way: it has no CUDA in it and no model to load.
-    image: localhost/glm53f-server:dev-gateway
-    pull_policy: never
-    build:
-      context: ..
-      dockerfile: docker/gateway/Dockerfile
