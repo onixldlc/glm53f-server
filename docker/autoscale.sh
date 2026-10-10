@@ -22,30 +22,23 @@ FIT_MARGIN_MIB="${FIT_MARGIN_MIB:-4096}"
 MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_PREFIX="${MODEL_PREFIX:-GLM-5.3-Flash}"
 MMPROJ_MIB=1110
-# GLM-5.3-Flash is a 1M-context model. At the KV cost below, 1M of f16 KV is
-# ~13 GiB, which is actually affordable on the larger tiers.
+# GLM-5.3-Flash is a 1M-context model, but nothing here reaches for that: the
+# context is pinned to CTX_TARGET and the quant is chosen around it.
 MODEL_MAX_CTX=1048576
-# What we try to reach before trading f16 KV away for q8_0. See pick_kv().
-CTX_TARGET="${CTX_TARGET:-131072}"
 
 # --- KV cost ----------------------------------------------------------------
-# ESTIMATED, not read from the GGUF header — unlike the qwen table this was
-# derived from the published architecture, so treat it as a starting point and
-# cross-check with --measure once the weights are on disk.
-#
-# 45 layers: 34 KDA linear-attention + 11 DSA sparse-attention over an MLA-only
-# path. Only the 11 MLA layers hold a per-token cache; linear attention keeps a
-# fixed-size state instead, which is why this is ~5x cheaper per token than a
-# 27B dense model.
-#
-#   11 layers * (kv_lora_rank 512 + qk_rope_head_dim 64) = 6336 elem/token
-#   f16:  6336 * 2      = 12672 B/token -> 12.375 MiB per 1024 tokens
-#   q8_0: 6336 * 1.0625 =  6732 B/token ->  6.573 MiB per 1024 tokens
-KV_MIB_PER_1K_F16=13
-KV_MIB_PER_1K_Q8=7
-# The 34 KDA layers' recurrent state does not grow with context, but it is not
-# free either, and it is charged per parallel sequence slot.
-KDA_STATE_MIB=34
+# Same per-token numbers the qwen image used: 64 MiB per 1024 tokens at f16,
+# 34 MiB at q8_0. Deliberately NOT the smaller figure the glm5-next geometry
+# would suggest — these are the measured ones, and overestimating KV costs a
+# quant tier at worst, while underestimating it costs a failed load.
+KV_MIB_PER_1K_F16=64
+KV_MIB_PER_1K_Q8=34
+
+# 131072 is a FLOOR, not a target. The quant is what flexes to make it fit:
+# pick_for_vram walks the quants largest-first and takes the first one that
+# holds this much context, trying f16 and then q8_0 on each. Raise it and the
+# table shifts down accordingly.
+CTX_TARGET="${CTX_TARGET:-131072}"
 
 # Total across devices: llama.cpp spreads layers over every visible GPU.
 detect_vram_mib() {
@@ -54,103 +47,90 @@ detect_vram_mib() {
         | awk '{ t += $1 + 0 } END { if (t > 0) print int(t); else exit 1 }'
 }
 
-# Each threshold is the real minimum for its row, not a round number:
+# Every quant of this model, largest first, with the real totals from the
+# Unsloth repo summed over every shard of that quant (the 00001 shard is a
+# ~9 MiB index, the rest carry the tensors). Sizes in GiB, for reading against
+# the table in the README:
+#   Q6_K_XL 271.79  Q5_K_XL 223.80  Q4_K_XL 185.99  IQ4_XS 146.05
+#   Q3_K_XL 137.40  IQ3_XXS 112.10  Q2_K_XL 101.25  IQ2_XXS  94.85
+#   IQ1_M    90.88  IQ1_S    86.69
 #
-#   weights + FIT_MARGIN_MIB(4096) + KDA_STATE_MIB(34) + mmproj(1110)
-#     + 128K of f16 KV(1664)  =  weights + 6904
-#
-# The tier LABEL is the rough VRAM class it targets; the threshold is what
-# actually has to be there. Both matter because no card reports its box number:
-# a 5090 reports 32607 MiB, so 4 of them are 130428 and not 131072, and
-# comparing against the round number would drop every host a tier.
-tier_of() {
-    local m="$1"
-    if   [ "$m" -ge 286000 ]; then echo 288
-    elif [ "$m" -ge 237000 ]; then echo 240
-    elif [ "$m" -ge 198000 ]; then echo 192
-    elif [ "$m" -ge 157000 ]; then echo 160
-    elif [ "$m" -ge 148000 ]; then echo 144
-    elif [ "$m" -ge 122000 ]; then echo 128
-    elif [ "$m" -ge 111000 ]; then echo 112
-    elif [ "$m" -ge 105000 ]; then echo 104
-    elif [ "$m" -ge 100000 ]; then echo 96
-    elif [ "$m" -ge  96000 ]; then echo 88
-    else                           echo 0
-    fi
+# Quality, where it has been measured (perplexity vs BF16 / same-top-p):
+#   IQ3_XXS 1.341x / 81.8%      Q2_K_XL  -    / 78%      IQ2_XXS 1.883x / 73.2%
+# The IQ2 -> IQ3 step halves KL divergence, so IQ3_XXS is the lowest quant
+# worth trusting for agentic work.
+QUANTS="\
+UD-Q6_K_XL:7:278314
+ UD-Q5_K_XL:6:229174
+ UD-Q4_K_XL:6:190456
+ UD-IQ4_XS:5:149557
+ UD-Q3_K_XL:4:140701
+ UD-IQ3_XXS:4:114791
+ UD-Q2_K_XL:4:103684
+ UD-IQ2_XXS:4:97127
+ UD-IQ1_M:3:93059
+ UD-IQ1_S:3:88775"
+
+# What one row costs on top of its weights, for a given KV type.
+overhead_mib() {
+    local per_1k="$1"
+    local o=$(( FIT_MARGIN_MIB + (CTX_TARGET / 1024) * per_1k ))
+    [ "$ENABLE_VISION" = "1" ] && o=$(( o + MMPROJ_MIB ))
+    printf '%s' "$o"
 }
 
 # Sets MODEL_FILE / CACHE_TYPE / CTX_SIZE from $1 = total VRAM in MiB.
 #
-# weights_mib and shards are the real totals from the Unsloth repo, summed over
-# every shard of that quant (the 00001 shard is a ~9 MiB index, the rest carry
-# the tensors). Sizes in GiB, for reading against the table in the README:
-#   IQ1_S 86.69  IQ1_M 90.88  IQ2_XXS 94.85  Q2_K_XL 101.25  IQ3_XXS 112.10
-#   Q3_K_XL 137.40  IQ4_XS 146.05  Q4_K_XL 185.99  Q5_K_XL 223.80  Q6_K_XL 271.79
-#
-# Quality, where it has been measured (perplexity vs BF16 / same-top-p):
-#   IQ3_XXS 1.341x / 81.8%      Q2_K_XL  -    / 78%      IQ2_XXS 1.883x / 73.2%
-# The IQ2 -> IQ3 step halves KL divergence, so 128 is the lowest tier worth
-# trusting for agentic work.
+# Walks the quants largest-first and takes the first that holds CTX_TARGET.
+# f16 is tried before q8_0 on each quant, so a row only drops to q8_0 when that
+# is what lets THAT quant fit — which means a bigger quant at q8_0 always wins
+# over a smaller one at f16. That is the right way round: the KV type costs far
+# less quality than a whole quant step does.
 pick_for_vram() {
     local vram_mib="$1"
-    local tier weights_mib quant shards
-    tier="$(tier_of "$vram_mib")"
+    local o_f16 o_q8 row quant shards weights_mib
+    o_f16="$(overhead_mib "$KV_MIB_PER_1K_F16")"
+    o_q8="$(overhead_mib "$KV_MIB_PER_1K_Q8")"
 
-    case "$tier" in
-        288) quant=UD-Q6_K_XL; shards=7; weights_mib=278314 ;;
-        240) quant=UD-Q5_K_XL; shards=6; weights_mib=229174 ;;
-        192) quant=UD-Q4_K_XL; shards=6; weights_mib=190456 ;;
-        160) quant=UD-IQ4_XS;  shards=5; weights_mib=149557 ;;
-        144) quant=UD-Q3_K_XL; shards=4; weights_mib=140701 ;;
-        128) quant=UD-IQ3_XXS; shards=4; weights_mib=114791 ;;
-        112) quant=UD-Q2_K_XL; shards=4; weights_mib=103684 ;;
-        104) quant=UD-IQ2_XXS; shards=4; weights_mib=97127  ;;
-        96)  quant=UD-IQ1_M;   shards=3; weights_mib=93059  ;;
-        88)  quant=UD-IQ1_S;   shards=3; weights_mib=88775  ;;
-        # No quant of a 320B model fits under ~94 GiB of VRAM. Pick the smallest
-        # one anyway and say plainly what will happen, rather than inventing a
-        # tier that cannot load.
-        *)   quant=UD-IQ1_S;   shards=3; weights_mib=88775
-             tier=0
-             say "WARNING ${vram_mib} MiB is below this model's floor."
-             say "  ${quant} alone is ${weights_mib} MiB. Layers will spill to host RAM;"
-             say "  drop N_GPU_LAYERS until it fits, or rent more VRAM."
-             ;;
-    esac
+    quant=""
+    for row in $QUANTS; do
+        local q="${row%%:*}"
+        local rest="${row#*:}"
+        local sh="${rest%%:*}"
+        local w="${rest#*:}"
+        if [ $(( w + o_f16 )) -le "$vram_mib" ]; then
+            quant="$q"; shards="$sh"; weights_mib="$w"; CACHE_TYPE=f16
+            MIN_MIB=$(( w + o_f16 ))
+            break
+        fi
+        if [ $(( w + o_q8 )) -le "$vram_mib" ]; then
+            quant="$q"; shards="$sh"; weights_mib="$w"; CACHE_TYPE=q8_0
+            MIN_MIB=$(( w + o_q8 ))
+            say "${q} needs q8_0 KV to hold ${CTX_TARGET} in ${vram_mib} MiB"
+            break
+        fi
+    done
+
+    # Nothing holds CTX_TARGET, not even the smallest quant with q8_0 KV.
+    if [ -z "$quant" ]; then
+        quant=UD-IQ1_S; shards=3; weights_mib=88775; CACHE_TYPE=q8_0
+        MIN_MIB=$(( weights_mib + o_q8 ))
+        say "WARNING ${vram_mib} MiB cannot hold ${CTX_TARGET} context at any quant."
+        say "  Smallest is ${quant} + q8_0 KV = ${MIN_MIB} MiB. Layers will spill to"
+        say "  host RAM; drop N_GPU_LAYERS, lower CTX_TARGET, or rent more VRAM."
+    fi
 
     MODEL_FILE="$(printf '%s/%s-%s-%05d-of-%05d.gguf' \
                   "$quant" "$MODEL_PREFIX" "$quant" 1 "$shards")"
 
-    # Everything the KV pool does NOT get.
-    local budget=$(( vram_mib - weights_mib - FIT_MARGIN_MIB - KDA_STATE_MIB ))
-    [ "$ENABLE_VISION" = "1" ] && budget=$(( budget - MMPROJ_MIB ))
-    [ "$budget" -lt 0 ] && budget=0
-
-    # Keep f16 KV unless CTX_TARGET will not fit in f16, and only then trade it
-    # for q8_0. On this architecture f16 at 128K costs ~1.6 GiB, so f16 wins on
-    # every tier that can hold the weights at all — but the rule is written out
-    # rather than hardcoded so it still self-corrects if the KV estimate above
-    # turns out low.
-    local per_1k="$KV_MIB_PER_1K_F16"
-    CACHE_TYPE=f16
-    if [ $(( CTX_TARGET / 1024 * KV_MIB_PER_1K_F16 )) -gt "$budget" ]; then
-        CACHE_TYPE=q8_0
-        per_1k="$KV_MIB_PER_1K_Q8"
-        say "f16 KV cannot reach ${CTX_TARGET} in ${budget} MiB, falling back to q8_0"
-    fi
-
-    local max_ctx=$(( (budget / per_1k) * 1024 ))
     CTX_SIZE="$CTX_TARGET"
-    if [ "$CTX_SIZE" -gt "$max_ctx" ]; then
-        say "target ${CTX_SIZE} does not fit ${vram_mib} MiB, using ${max_ctx}"
-        CTX_SIZE="$max_ctx"
-    fi
-
     [ "$CTX_SIZE" -gt "$MODEL_MAX_CTX" ] && CTX_SIZE="$MODEL_MAX_CTX"
     [ "$CTX_SIZE" -lt 4096 ] && CTX_SIZE=4096
     CTX_SIZE=$(( (CTX_SIZE / 4096) * 4096 ))
 
-    TIER="$tier"
+    # Reported as the minimum VRAM this row actually needs, which is more use
+    # than a round label when every quant is within a few GiB of the next.
+    TIER=$(( MIN_MIB / 1024 ))
     WEIGHTS_MIB="$weights_mib"
     MODEL_QUANT="$quant"
     MODEL_SHARDS="$shards"
@@ -193,11 +173,11 @@ fi
 per_1k="$KV_MIB_PER_1K_F16"
 [ "$CACHE_TYPE" = "q8_0" ] && per_1k="$KV_MIB_PER_1K_Q8"
 kv_mib=$(( CTX_SIZE / 1024 * per_1k ))
-used_mib=$(( WEIGHTS_MIB + kv_mib + KDA_STATE_MIB ))
+used_mib=$(( WEIGHTS_MIB + kv_mib ))
 [ "$ENABLE_VISION" = "1" ] && used_mib=$(( used_mib + MMPROJ_MIB ))
 
-say "${VRAM_MIB} MiB -> ${TIER} GB tier: ${MODEL_QUANT} (${MODEL_SHARDS} shards) + ${CTX_SIZE} ctx @ ${CACHE_TYPE} KV"
-say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + kda ${KDA_STATE_MIB} MiB + mmproj $([ "$ENABLE_VISION" = "1" ] && echo $MMPROJ_MIB || echo 0) MiB = ${used_mib} MiB, $(( VRAM_MIB - used_mib )) MiB free"
+say "${VRAM_MIB} MiB -> ${MODEL_QUANT} (${MODEL_SHARDS} shards) + ${CTX_SIZE} ctx @ ${CACHE_TYPE} KV, needs ${TIER} GiB"
+say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + mmproj $([ "$ENABLE_VISION" = "1" ] && echo $MMPROJ_MIB || echo 0) MiB = ${used_mib} MiB, $(( VRAM_MIB - used_mib )) MiB free"
 
 printf 'VRAM_MIB=%s\n'     "$VRAM_MIB"
 printf 'TIER=%s\n'         "$TIER"

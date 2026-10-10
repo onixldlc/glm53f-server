@@ -77,8 +77,9 @@ ENV VRAM_MIB=
 ENV FIT_MARGIN_MIB=4096
 # A number, or 'auto' to drop --ctx-size and let llama.cpp's own fitter size the
 # KV pool against free VRAM. Ignored when AUTO_SCALE=1 picks a value.
-# Only 11 of 45 layers hold a per-token KV cache, so 128K of f16 KV is ~1.6 GiB
-# and there is no reason to start lower.
+# 131072 is the floor autoscale.sh sizes the quant around, not a target: it picks
+# the largest quant that holds this much context, f16 KV if it fits and q8_0 if
+# that is what makes that quant fit. Override with CTX_TARGET.
 ENV CTX_SIZE=131072
 ENV N_GPU_LAYERS=99
 # 0 on the CPU build; empty means "let llama.cpp pick" (cores - 1 is usually right).

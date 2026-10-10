@@ -350,59 +350,60 @@ No registry secrets to set up — it logs in with the built-in `GITHUB_TOKEN`. A
 ## Auto-scaling to the host
 
 `AUTO_SCALE=1` (the default) sums total VRAM across every visible card with `nvidia-smi` at
-start and picks the quant, the context and the KV cache type to match:
+start, then picks the **largest quant that holds 131072 context**, using `f16` KV if it fits
+and `q8_0` if that is what makes that quant fit.
 
-| VRAM | `MODEL_FILE` quant | KV | Context | Used | Free |
-|---|---|---|---|---|---|
-| 288 GB | `UD-Q6_K_XL` | f16 | 131072 | 281122 MiB | 8878 MiB |
-| 240 GB | `UD-Q5_K_XL` | f16 | 131072 | 231982 MiB | 8018 MiB |
-| 192 GB | `UD-Q4_K_XL` | f16 | 131072 | 193264 MiB | 6736 MiB |
-| 160 GB | `UD-IQ4_XS` | f16 | 131072 | 152365 MiB | 7635 MiB |
-| 144 GB | `UD-Q3_K_XL` | f16 | 131072 | 143509 MiB | 6491 MiB |
-| 128 GB | `UD-IQ3_XXS` | f16 | 131072 | 117599 MiB | 12401 MiB |
-| 112 GB | `UD-Q2_K_XL` | f16 | 131072 | 106492 MiB | 5508 MiB |
-| 104 GB | `UD-IQ2_XXS` | f16 | 131072 | 99935 MiB | 5065 MiB |
-| 96 GB | `UD-IQ1_M` | f16 | 131072 | 95867 MiB | 4133 MiB |
-| 88 GB | `UD-IQ1_S` | f16 | 131072 | 91583 MiB | 4917 MiB |
+**128K is a floor, not a target.** The context never shrinks — the quant is what flexes.
 
-Figures are with `ENABLE_VISION=1` (mmproj 1110 MiB), measured at each row's *threshold*, so
-"Free" is the worst case for that row and still includes the 4096 MiB `FIT_MARGIN_MIB`.
+| Quant | Shards | Weights | Min VRAM, f16 KV | Min VRAM, q8_0 KV |
+|---|---|---|---|---|
+| `UD-Q6_K_XL` | 7 | 271.79 GiB | 291712 MiB | 287872 MiB |
+| `UD-Q5_K_XL` | 6 | 223.80 GiB | 242572 MiB | 238732 MiB |
+| `UD-Q4_K_XL` | 6 | 185.99 GiB | 203854 MiB | 200014 MiB |
+| `UD-IQ4_XS` | 5 | 146.05 GiB | 162955 MiB | 159115 MiB |
+| `UD-Q3_K_XL` | 4 | 137.40 GiB | 154099 MiB | 150259 MiB |
+| **`UD-IQ3_XXS`** | 4 | **112.10 GiB** | **128189 MiB** | **124349 MiB** |
+| `UD-Q2_K_XL` | 4 | 101.25 GiB | 117082 MiB | 113242 MiB |
+| `UD-IQ2_XXS` | 4 | 94.85 GiB | 110525 MiB | 106685 MiB |
+| `UD-IQ1_M` | 3 | 90.88 GiB | 106457 MiB | 102617 MiB |
+| `UD-IQ1_S` | 3 | 86.69 GiB | 102173 MiB | 98333 MiB |
 
-Two things differ from the qwen image and both are worth reading twice:
+Minimums are `weights + FIT_MARGIN_MIB(4096) + mmproj(1110) + 128K of KV`, so **13398 MiB of
+overhead at f16 and 9558 MiB at q8_0**. Drop `ENABLE_VISION` and each figure falls by 1110.
 
-**Every row gets 131072 at f16.** There is no q8_0 tier. Of 45 layers only 11 are DSA sparse
-attention over an MLA path and hold a per-token cache; the other 34 are KDA linear attention,
-whose state is a fixed size no matter how long the context gets. So:
+The KV numbers are the same ones the qwen image used — **64 MiB per 1024 tokens at f16, 34 MiB
+at q8_0** — which is to say they are measured rather than inferred from this model's layer
+geometry. Overestimating KV costs at most a quant tier; underestimating it costs a failed load.
+
+What that buys in practice:
+
+| Host | Total VRAM | Picks | KV | Free |
+|---|---|---|---|---|
+| 4x A100-80 | 327680 MiB | `UD-Q6_K_XL` | f16 | 40064 MiB |
+| 2x H200-141 | 288768 MiB | `UD-Q6_K_XL` | **q8_0** | 4992 MiB |
+| 8x RTX 5090 | 260856 MiB | `UD-Q5_K_XL` | f16 | 22380 MiB |
+| 6x RTX 5090 | 195642 MiB | `UD-IQ4_XS` | f16 | 36783 MiB |
+| **2x A100-80** | **163840 MiB** | **`UD-IQ4_XS`** | f16 | 4981 MiB |
+| 1x H200-141 | 144384 MiB | `UD-IQ3_XXS` | f16 | 20291 MiB |
+| **4x RTX 5090** | **130428 MiB** | **`UD-IQ3_XXS`** | f16 | 6335 MiB |
+| 3x RTX 5090 | 97821 MiB | `UD-IQ1_S` | q8_0 | **does not fit** |
+
+The 2x H200 row is the whole point of the fallback: dropping KV to `q8_0` frees 3840 MiB, which
+is enough to keep `UD-Q6_K_XL` instead of falling to `UD-Q5_K_XL`. f16 is tried first on every
+quant, so a row only goes to `q8_0` when that is what lets **that** quant fit — a bigger quant
+at `q8_0` always beats a smaller one at `f16`, because the KV type costs far less quality than
+a whole quant step.
+
+**There is a floor, and it is high.** Below 98333 MiB nothing holds 128K at any quant.
+`autoscale.sh` picks `UD-IQ1_S` and says so loudly rather than quietly shrinking your context:
 
 ```
-11 layers x (kv_lora_rank 512 + qk_rope_head_dim 64)  =  6336 elements/token
-  f16:  6336 x 2      = 12672 B/token  ->  12.375 MiB per 1024 tokens
-  q8_0: 6336 x 1.0625 =  6732 B/token  ->   6.573 MiB per 1024 tokens
+[autoscale] WARNING 97821 MiB cannot hold 131072 context at any quant.
+[autoscale]   Smallest is UD-IQ1_S + q8_0 KV = 98333 MiB. Layers will spill to
+[autoscale]   host RAM; drop N_GPU_LAYERS, lower CTX_TARGET, or rent more VRAM.
 ```
 
-128K of f16 KV is about **1.6 GiB**. Dropping to q8_0 would save 0.8 GiB against a 112 GiB
-model, which is not a trade worth making. `autoscale.sh` still implements the rule — f16 unless
-`CTX_TARGET` will not fit in f16, only then q8_0 — so it self-corrects if the estimate is off.
-
-> These KV constants are **derived from the published architecture, not read out of the GGUF
-> header** the way the qwen numbers were. Treat them as a starting point and cross-check with
-> `autoscale.sh --measure` once the weights are on disk.
-
-**There is a floor, and it is high.** Below roughly 95 GiB of total VRAM no quant of a 320B
-model fits on the GPU at all. `autoscale.sh` picks `UD-IQ1_S` and says so loudly rather than
-pretending a tier exists:
-
-```
-[autoscale] WARNING 81920 MiB is below this model's floor.
-[autoscale]   UD-IQ1_S alone is 88775 MiB. Layers will spill to host RAM;
-[autoscale]   drop N_GPU_LAYERS until it fits, or rent more VRAM.
-```
-
-Each threshold is the real minimum for its row rather than a round number:
-`weights + FIT_MARGIN_MIB(4096) + KDA state(34) + mmproj(1110) + 128K f16 KV(1664)`, i.e.
-`weights + 6904`. The tier *label* is the rough VRAM class it targets. Both matter, because no
-card reports its box number: a 5090 reports 32607 MiB, so four of them are 130428 and not
-131072, and comparing against the round number would drop every host a tier.
+That is 3x RTX 5090 missing it by 512 MiB. Four cards is the real entry point.
 
 The logic lives in `docker/autoscale.sh`, not buried in the entrypoint, so you can ask it what
 it would do without starting anything:
@@ -410,6 +411,7 @@ it would do without starting anything:
 ```bash
 $ autoscale.sh                       # decide from nvidia-smi
 $ VRAM_MIB=163840 autoscale.sh       # decide for a host you do not have
+$ CTX_TARGET=262144 autoscale.sh     # raise the floor; the table shifts down
 $ autoscale.sh --measure             # ask llama-fit-params (needs the weights)
 ```
 
@@ -467,30 +469,24 @@ why `FIT_MARGIN_MIB` defaults to 4096 rather than llama.cpp's stock 1024.
 
 ## Pick the quant
 
-All sizes are the **sum of every shard** of that quant, from the Unsloth repo:
-
-| Min VRAM | Quant | Shards | Size | Perplexity vs BF16 | Same-top-p |
-|---|---|---|---|---|---|
-| 88 GB | `UD-IQ1_S` | 3 | 86.69 GiB | — | — |
-| 96 GB | `UD-IQ1_M` | 3 | 90.88 GiB | — | — |
-| 104 GB | `UD-IQ2_XXS` | 4 | 94.85 GiB | 1.883x | 73.2% |
-| 112 GB | `UD-Q2_K_XL` | 4 | 101.25 GiB | — | 78% |
-| **128 GB** | **`UD-IQ3_XXS`** | 4 | **112.10 GiB** | **1.341x** | **81.8%** |
-| 144 GB | `UD-Q3_K_XL` | 4 | 137.40 GiB | — | — |
-| 160 GB | `UD-IQ4_XS` | 5 | 146.05 GiB | — | — |
-| 192 GB | `UD-Q4_K_XL` | 6 | 185.99 GiB | — | — |
-| 240 GB | `UD-Q5_K_XL` | 6 | 223.80 GiB | — | — |
-| 288 GB | `UD-Q6_K_XL` | 7 | 271.79 GiB | — | — |
-
-Add 1.08 GB for the vision tower (`ENABLE_VISION=1`) and ~1.6 GiB of f16 KV at 128K on top.
+The table under [Auto-scaling](#auto-scaling-to-the-host) is the sizing reference — it lists
+every quant with its shard count, weight total and the minimum VRAM for 128K at each KV type.
 
 **`UD-IQ3_XXS` is the one to aim at.** The `IQ2_XXS -> IQ3_XXS` step halves KL divergence
 (0.7072 to 0.3557), gains 8.56 points of same-top-p agreement and drops the perplexity penalty
-from 1.88x to 1.34x, for 17 GiB more weights. Below it the model gets measurably unreliable;
-above it the gains are small until `UD-IQ4_XS`.
+from 1.88x to 1.34x, for 17 GiB more weights:
+
+| Quant | Perplexity vs BF16 | Same-top-p | KL divergence |
+|---|---|---|---|
+| `UD-IQ3_XXS` | 1.341x | 81.8% | 0.3557 |
+| `UD-Q2_K_XL` | — | 78% | — |
+| `UD-IQ2_XXS` | 1.883x | 73.2% | 0.7072 |
+
+Below `IQ3_XXS` the model gets measurably unreliable; above it the gains are small until
+`UD-IQ4_XS`. Nothing above `IQ4_XS` has published quality figures.
 
 About 1 GiB of precision-sensitive tensors — the DSA indexer and the KDA gates — are kept
-unquantized in every one of these, which is already counted in the sizes above.
+unquantized in every one of these, which is already counted in the weight totals.
 
 ## Run
 
@@ -595,9 +591,9 @@ What is tuned differently in `cpu/.env`:
 | `THREADS` / `THREADS_BATCH` | `3` | matched to the quota |
 | `ENABLE_VISION` | `0` | the vision tower is slow without a GPU |
 | `CTX_SIZE` | `32768` | prompt processing, not RAM, is the limit here |
-| `MEM_LIMIT` | `124g` | 112.1 GiB weights + ~0.4 GiB f16 KV + overhead |
+| `MEM_LIMIT` | `124g` | 112.1 GiB weights + 1 GiB q8_0 KV at 32768 + overhead |
 | `--reasoning-effort` | `low` | thinking tokens decode one at a time; on CPU they are the most expensive thing you can ask for |
-| KV cache | `f16` | only 11 of 45 layers hold a per-token cache; nothing to reclaim |
+| KV cache | `q8_0` | halves cache RAM, and RAM is the binding constraint here |
 
 ### Capping CPU usage
 
@@ -614,7 +610,7 @@ frozen half the time, which wastes cache locality and adds latency.
 leaving the hard cap untouched. `mem_limit` bounds RAM. Swap in `cpuset: "0-2"` for hard core
 pinning if you want the inference confined to specific cores rather than given a time share.
 
-Sizing: 112.1 GiB of weights at `UD-IQ3_XXS` + ~0.4 GiB of f16 KV at 32768 + overhead, so a
+Sizing: 112.1 GiB of weights at `UD-IQ3_XXS` + 1 GiB of q8_0 KV at 32768 + overhead, so a
 128 GB box is the realistic floor. `UD-IQ2_XXS` (94.85 GiB) brings that to about 104 GB and
 `UD-IQ1_S` (86.69 GiB) to about 96 GB. It is bound by memory bandwidth rather than clock
 speed, so a box with faster RAM beats one with more cores. Measure yours before committing:
