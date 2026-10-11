@@ -113,15 +113,45 @@ log "  /manage/files       listing JSON      /manage/upload    PUT raw body"
 log "  /manage/download/   read a file back  /manage/health    gateway liveness"
 log "  /                   llama.cpp WebUI and API, proxied"
 
+# An nginx left over from a previous entrypoint run still holds LISTEN_PORT, and
+# a fresh one cannot bind it: restarting the entrypoint by hand is the normal
+# way to pick up new settings on a rented box, and without this it dies on
+# "bind() to 0.0.0.0:PORT failed (98: Address already in use)" — killed by its
+# own leftover. Only nginx is stopped here; anything else holding the port is
+# not ours to kill, and nginx will report that itself.
+stop_old_nginx() {
+    local waited=0
+
+    pgrep -x nginx >/dev/null 2>&1 || return 0
+
+    log "nginx already running — stopping it before taking :${LISTEN_PORT}"
+    nginx -s quit 2>/dev/null || pkill -x nginx 2>/dev/null || true
+
+    # quit is graceful and waits for in-flight requests, so give it a moment
+    # before escalating.
+    while [ "$waited" -lt 10 ]; do
+        pgrep -x nginx >/dev/null 2>&1 || return 0
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+
+    log "nginx did not stop in ${waited}s, killing it"
+    pkill -x -9 nginx 2>/dev/null || true
+    sleep 1
+    return 0
+}
+
 case "$MODE" in
     foreground)
+        stop_old_nginx
         exec nginx -c "$CONF" -g 'daemon off;'
         ;;
     start)
         # Daemonised on purpose: llama-server is the container's main process, so
         # the container's lifetime tracks the model and not the proxy. nginx
         # comes up FIRST, which is what keeps /manage/ answering through a first
-        # run's 87-272 GiB download — / is 502 until the upstream is up.
+        # run's 87-272 GiB download — / is 503 until the upstream is up.
+        stop_old_nginx
         nginx -c "$CONF"
         log "nginx started (pid $(cat /run/nginx.pid 2>/dev/null || echo '?'))"
         ;;

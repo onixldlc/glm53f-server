@@ -555,6 +555,52 @@ stopped Vast instance keeps its container disk at the storage rate (200 GB is
 about $1.78/day) and starts again with the shards already there. Destroying it
 means paying for the download twice.
 
+### Tools the model can actually call
+
+Two different sets, and they are easy to confuse:
+
+* **`--tools`** — llama.cpp's built-in tools, set by `TOOLS`. These touch files:
+  `read_file`, `file_glob_search`, `grep_search`, `write_file`, `edit_file`,
+  `get_info`, `exec_shell_command`. llama.cpp's own default is **no tools at
+  all**, so this image sets them explicitly.
+* **MCP servers** — `files` (`uploads_list`, `uploads_peek`, `uploads_extract`,
+  `uploads_tree`, `uploads_stat`) and `web` (`web_search`, `web_fetch`). The
+  `files` server says WHAT was uploaded and WHERE; it is `read_file` that opens
+  it. Paths it returns are relative to `/workspace`, which is `WORKDIR`, so they
+  go straight into `read_file`.
+
+The default leaves `exec_shell_command` out: it runs commands on the host and
+anything that reaches the chat endpoint can call it. `TOOLS=all` enables every
+tool including that one, and the entrypoint warns when it does. `TOOLS=` (empty)
+disables them. `LLAMA_ARG_TOOLS` or a `--tools` in `EXTRA_ARGS` wins over
+`TOOLS`, and the entrypoint says which one it used:
+
+```
+[glm53f] built-in tools: read_file,file_glob_search,grep_search,write_file,edit_file,get_info
+```
+
+Enabling any tool makes llama.cpp clamp `--cors-origins` to localhost. An
+unknown name is fatal at startup rather than silently dropped:
+`tools setup failed: unknown tool "x". available tools: ...`
+
+### The WebUI answers 415 to curl, and that is not the proxy
+
+llama.cpp serves its WebUI **gzip-only**. A request without `Accept-Encoding:\
+ gzip` gets `415 Unsupported Media Type / Error: gzip is not supported by this
+browser` — straight from llama-server on 8081, with or without nginx in front.
+Browsers always send it; `curl` does not unless you pass `--compressed`:
+
+```sh
+curl --compressed localhost:8080/        # 200, the UI
+curl localhost:8080/                     # 415, gzip not accepted
+curl localhost:8080/health               # 200, API paths are unaffected
+```
+
+Verified against the real images: every endpoint returns byte-identical results
+through nginx and straight from llama-server — `/`, `/index.html`, `/sw.js`,
+`/props`, `/v1/models`, `/slots`, `/health`, non-streaming chat, and SSE
+streaming (same event count both ways).
+
 ### When the table is still wrong
 
 A table cannot measure compute buffers, and llama.cpp's own fitter — which can — refuses to run

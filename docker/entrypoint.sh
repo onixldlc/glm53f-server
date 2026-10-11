@@ -116,12 +116,20 @@ head_bytes() {
 # a single slow 30s window on a 50 GB shard is noise, not news.
 progress_watch() {
     local path="$1" expect="$2" label="$3"
-    local start cur now elapsed rate pct line remain_job
+    local start cur alloc now elapsed rate pct line remain_job
     start="$(date +%s)"
     [ "$PROGRESS_INTERVAL" -gt 0 ] 2>/dev/null || return 0
     while :; do
         sleep "$PROGRESS_INTERVAL"
+        # Apparent size is wrong while aria2 is running: it writes its ranges
+        # in parallel into a SPARSE file, so the file reaches full length almost
+        # at once and the percentage would sit at 100% for the whole download.
+        # Allocated blocks count only what has really been written, so the
+        # smaller of the two is the honest figure.
         cur="$(stat -c %s "$path" 2>/dev/null || echo 0)"
+        alloc="$(stat -c %b "$path" 2>/dev/null || echo 0)"
+        alloc=$(( alloc * 512 ))
+        [ "$alloc" -gt 0 ] && [ "$alloc" -lt "$cur" ] && cur="$alloc"
         [ "$cur" -gt 0 ] 2>/dev/null || continue
         now="$(date +%s)"
         elapsed=$(( now - start ))
@@ -431,6 +439,47 @@ if [ "${MCP_ENABLE:-0}" = "1" ]; then
             log "  files: uploads under ${UPLOADS_WORKSPACE:-/workspace}"
         fi
     fi
+fi
+
+# --- built-in tools ---------------------------------------------------------
+#
+# llama.cpp defaults --tools to NOTHING, so a server with MCP configured still
+# has no read_file/write_file/edit_file and cannot touch the workspace this
+# image goes to the trouble of mounting, creating and setting as WORKDIR. The
+# MCP servers are a different set: 'files' lists and extracts uploads, 'web'
+# searches. Neither reads a file the model names.
+#
+# Default is the file set. exec_shell_command is deliberately NOT in it — it is
+# a shell on the box reachable from any chat message that gets through the front
+# door. TOOLS=all turns on everything including that; TOOLS= disables the lot.
+#
+# Available in b11461: read_file, file_glob_search, grep_search,
+# exec_shell_command, write_file, edit_file, get_info.
+# No colon: TOOLS= set to an empty value means "no tools", while unset means
+# the default. ${TOOLS:-...} would ignore the difference and re-enable them.
+TOOLS="${TOOLS-read_file,file_glob_search,grep_search,write_file,edit_file,get_info}"
+
+tools_set=0
+case " ${EXTRA_ARGS} " in
+    *" --tools "*|*" --tools="*) tools_set=1 ;;
+esac
+if [ -n "${LLAMA_ARG_TOOLS:-}" ]; then
+    # llama-server reads this itself, and a flag here would override what the
+    # user asked for.
+    log "built-in tools: from LLAMA_ARG_TOOLS (${LLAMA_ARG_TOOLS})"
+elif [ "$tools_set" = "1" ]; then
+    log "built-in tools: from EXTRA_ARGS"
+elif [ -n "$TOOLS" ]; then
+    args+=(--tools "$TOOLS")
+    log "built-in tools: ${TOOLS}"
+    case ",${TOOLS}," in
+        *,all,*|*,exec_shell_command,*)
+            log "  WARNING exec_shell_command is on — any chat message that reaches this"
+            log "  server can run commands on this host. Keep the port private."
+            ;;
+    esac
+else
+    log "built-in tools: none (TOOLS is empty)"
 fi
 
 # nginx writes here and the built-in file tools read from here. gateway.sh makes

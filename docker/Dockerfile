@@ -167,6 +167,15 @@ ENV HTTP_TIMEOUT=20
 # path mcp-files reports is already relative to what the built-in file tools
 # resolve against — that is the whole trick, and changing one without the other
 # breaks it.
+# llama.cpp's built-in tools, comma separated, passed as --tools. Its own
+# default is NO tools, which leaves the model unable to read the workspace this
+# image mounts for it. exec_shell_command is left out on purpose: it is a shell
+# on this host, reachable from any chat message. TOOLS=all enables everything,
+# TOOLS= disables them.
+# b11461 offers: read_file, file_glob_search, grep_search, exec_shell_command,
+# write_file, edit_file, get_info.
+ENV TOOLS=read_file,file_glob_search,grep_search,write_file,edit_file,get_info
+
 ENV UPLOADS_WORKSPACE=/workspace
 ENV INBOX_SUBDIR=inbox
 ENV EXTRACT_SUBDIR=extracted
