@@ -146,6 +146,10 @@ ENV ACCESS_LOG=off
 # can expose 200+ cores and auto forks one worker per core, which is hundreds of
 # processes and several GB of RSS to proxy a single upstream.
 ENV WORKER_PROCESSES=4
+# What /manage/ may list and download. Defaults to the uploads volume; set it
+# to / to browse the whole container, or to /models for the weights. Paths are
+# still confined to it, and uploads always land in INBOX_DIR regardless.
+ENV BROWSE_ROOT=
 ENV DOWNLOAD_ATTEMPTS=20
 # How long llama-server has to stay up before a later exit counts as a real
 # crash rather than a bad fit. Under this, the entrypoint retries on the same

@@ -34,6 +34,22 @@ function cfg(r) {
     };
 }
 
+// A path under root, without the root. Not just slice(root.length + 1): a root
+// of "/" has no separator to skip, and chopping a character for one that is not
+// there turned /workspace/inbox/x into "orkspace/inbox/x".
+function relTo(root, p) {
+    if (root === '/' || root === '') {
+        return p.replace(/^\/+/, '');
+    }
+    if (p === root) {
+        return '';
+    }
+    if (p.slice(0, root.length + 1) === root + '/') {
+        return p.slice(root.length + 1);
+    }
+    return p;
+}
+
 function json(r, status, obj) {
     r.headersOut['Content-Type'] = 'application/json';
     r.headersOut['Cache-Control'] = 'no-store';
@@ -179,12 +195,20 @@ function upload(r) {
         });
     }
 
+    // The inbox is not necessarily inside BROWSE_ROOT: point the browser at
+    // /models and uploads still land in the volume, where this page cannot
+    // reach them. Say so rather than handing back a download URL that 404s.
+    var rel_path = relTo(c.data, dest);
+    var reachable = rel_path !== dest;
+
     return json(r, 201, {
         stored: name,
         bytes: size,
-        workspace_path: dest.slice(c.data.length + 1),
-        note: 'workspace_path is relative to the model server working directory',
-        download: '/manage/download/' + dest.slice(c.data.length + 1),
+        workspace_path: rel_path,
+        note: reachable
+            ? 'workspace_path is relative to the model server working directory'
+            : 'stored outside BROWSE_ROOT, so this page cannot list or download it',
+        download: reachable ? '/manage/download/' + rel_path : null,
     });
 }
 
@@ -220,6 +244,7 @@ function list(r) {
     if (!st.isDirectory()) {
         return json(r, 200, {
             root: rel || '.',
+            root_abs: c.data,
             depth: depth,
             truncated: false,
             count: 1,
@@ -271,6 +296,7 @@ function list(r) {
 
     return json(r, 200, {
         root: rel || '.',
+        root_abs: c.data,
         depth: depth,
         truncated: truncated,
         count: entries.length,

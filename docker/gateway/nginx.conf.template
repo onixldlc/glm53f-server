@@ -86,7 +86,9 @@ http {
         # upload.js reads its configuration from these rather than process.env:
         # nginx hands a worker an environment stripped to TZ unless every name is
         # declared in an `env` directive at main level.
-        set $data_dir     "__DATA_DIR__";
+        # The tree /manage/ may list and download. BROWSE_ROOT, not DATA_DIR:
+        # uploads still go to $inbox_dir below, which stays under DATA_DIR.
+        set $data_dir     "__BROWSE_ROOT__";
         set $inbox_dir    "__INBOX_DIR__";
         set $upload_token "__UPLOAD_TOKEN__";
 
@@ -138,7 +140,7 @@ http {
         # /__dl../ escapes the directory.
         location ^~ /__dl/ {
             internal;
-            alias __DATA_DIR__/;
+            alias __BROWSE_ROOT__/;
             autoindex off;
             add_header Content-Disposition "attachment";
         }

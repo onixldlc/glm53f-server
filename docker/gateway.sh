@@ -41,6 +41,15 @@ ERROR_LEVEL="${ERROR_LEVEL:-warn}"
 # download or a model load in access lines, so this is off unless asked for.
 # "on" means /dev/stdout; any other value is passed to nginx as written, so a
 # path works too.
+# What the file manager is allowed to see. Defaults to the uploads volume, so
+# the page shows exactly what was uploaded and nothing else. Point it somewhere
+# wider — BROWSE_ROOT=/ for the whole box, or /models for the weights — when you
+# want to browse more than the inbox. It is a ROOT, not a licence: paths are
+# still resolved inside it and ".." still cannot climb out, so widening this is
+# a deliberate choice rather than a hole.
+#
+# Uploads are unaffected: they always land in INBOX_DIR under DATA_DIR.
+BROWSE_ROOT="${BROWSE_ROOT:-$DATA_DIR}"
 WORKER_PROCESSES="${WORKER_PROCESSES:-4}"
 ACCESS_LOG="${ACCESS_LOG:-off}"
 case "$ACCESS_LOG" in
@@ -97,6 +106,7 @@ sed -e "s#__NJS_MODULE__#${NJS_MODULE}#g" \
     -e "s#__ERROR_LEVEL__#${ERROR_LEVEL}#g" \
     -e "s#__ACCESS_LOG__#${ACCESS_LOG}#g" \
     -e "s#__WORKER_PROCESSES__#${WORKER_PROCESSES}#g" \
+    -e "s#__BROWSE_ROOT__#${BROWSE_ROOT}#g" \
     /etc/glm53f/nginx.conf.template > "$CONF"
 
 if grep -q '__[A-Z_]*__' "$CONF"; then
@@ -110,6 +120,25 @@ fi
 nginx -t -c "$CONF"
 
 log "listening on :${LISTEN_PORT}, upstream ${UPSTREAM}, uploads -> ${INBOX_DIR}"
+if [ "$BROWSE_ROOT" != "$DATA_DIR" ]; then
+    log "  BROWSE_ROOT=${BROWSE_ROOT} — /manage/ lists and downloads anything under it"
+    inbox_inside=0
+    if [ "$BROWSE_ROOT" = "/" ]; then
+        inbox_inside=1
+    else
+        case "$INBOX_DIR/" in
+            "$BROWSE_ROOT"/*) inbox_inside=1 ;;
+        esac
+    fi
+    case "$inbox_inside" in
+        1) ;;
+        *)
+            log "  WARNING ${INBOX_DIR} is outside ${BROWSE_ROOT}: uploads will still work"
+            log "  but this page cannot list or download them. Set BROWSE_ROOT to a"
+            log "  directory that contains the inbox if you want both."
+            ;;
+    esac
+fi
 log "  /manage/            file manager page"
 log "  /manage/files       listing JSON      /manage/upload    PUT raw body"
 log "  /manage/download/   read a file back  /manage/health    gateway liveness"
