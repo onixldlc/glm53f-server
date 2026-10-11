@@ -121,6 +121,10 @@ ENV UPLOAD_TOKEN=
 ENV MAX_UPLOAD_SIZE=8g
 ENV ERROR_LEVEL=warn
 ENV DOWNLOAD_ATTEMPTS=20
+# How long llama-server has to stay up before a later exit counts as a real
+# crash rather than a bad fit. Under this, the entrypoint retries on the same
+# weights with a smaller KV type and context (see entrypoint.sh).
+ENV GRACE_SECONDS=180
 ENV EXTRA_ARGS=
 # Tool servers, off by default. 1 renders the MCP config and hands llama-server
 # --mcp-servers-config. Which servers that config ends up holding is the two

@@ -248,9 +248,14 @@ mkdir -p "${UPLOADS_WORKSPACE:-/workspace}/${INBOX_SUBDIR:-inbox}" \
 
 log "volume holds: $(ls -1A "$MODEL_DIR" | tr '\n' ' ')"
 
+# EXTRA_ARGS lives in its own array so it can be appended LAST. llama.cpp takes
+# the final occurrence of a repeated flag, so anything the user put in here has
+# to come after the --ctx-size / --cache-type arguments this script generates,
+# or their override would silently lose to ours.
+extra_args=()
 if [ -n "${EXTRA_ARGS}" ]; then
     # shellcheck disable=SC2206
-    args+=(${EXTRA_ARGS})
+    extra_args=(${EXTRA_ARGS})
 fi
 
 # --- start, and step down rather than strand the host -----------------------
@@ -272,24 +277,41 @@ if [ "$KV_IS_OURS" = "1" ] && [ "${CTX_SIZE}" != "auto" ]; then
     ladder+=("q8_0:$(( CTX_SIZE / 4 ))")
 fi
 
+# llama-server is no longer exec'd, so it is no longer PID 1 and no longer gets
+# `podman stop`'s SIGTERM by itself. Without this it would sit through the stop
+# timeout and be SIGKILLed, losing a clean shutdown — and the ladder below would
+# read that as a failed load and "helpfully" restart it smaller.
+STOPPING=0
+on_signal() {
+    STOPPING=1
+    log "signal received, stopping llama-server"
+    [ -n "${LLAMA_PID:-}" ] && kill -TERM "$LLAMA_PID" 2>/dev/null || true
+}
+trap on_signal TERM INT
+
 run_llama() {
-    local started ran rc
+    local started rc
     log "llama-server ${*}"
     started="$(date +%s)"
+    /app/bin/llama-server "$@" &
+    LLAMA_PID=$!
     set +e
-    /app/bin/llama-server "$@"
+    # Returns 128+n the moment a trap fires, with the child still shutting down;
+    # the second wait reaps it for real.
+    wait "$LLAMA_PID"
     rc=$?
+    [ "$STOPPING" = "1" ] && wait "$LLAMA_PID" 2>/dev/null
     set -e
-    ran=$(( $(date +%s) - started ))
-    LAST_RAN="$ran"
+    LAST_RAN=$(( $(date +%s) - started ))
     return "$rc"
 }
 
-attempt_args=("${args[@]}" "${ctx_args[@]}" "${kv_args[@]}" "$@")
+attempt_args=("${args[@]}" "${ctx_args[@]}" "${kv_args[@]}" "${extra_args[@]}" "$@")
 
 if run_llama "${attempt_args[@]}"; then
     exit 0
 fi
+[ "$STOPPING" = "1" ] && { log "stopped on signal"; exit 0; }
 
 for rung in "${ladder[@]}"; do
     # Served for a while and then stopped: that is not a sizing problem, and
@@ -306,10 +328,12 @@ for rung in "${ladder[@]}"; do
     log "  Same weights, nothing re-downloaded. Set CTX_TARGET or FIT_MARGIN_MIB"
     log "  to pick this directly next boot and skip the failed attempt."
 
-    attempt_args=("${args[@]}" --ctx-size "$ctx" --cache-type-k "$kv" --cache-type-v "$kv" "$@")
+    attempt_args=("${args[@]}" --ctx-size "$ctx" --cache-type-k "$kv" --cache-type-v "$kv" \
+                  "${extra_args[@]}" "$@")
     if run_llama "${attempt_args[@]}"; then
         exit 0
     fi
+    [ "$STOPPING" = "1" ] && { log "stopped on signal"; exit 0; }
 done
 
 log ""
