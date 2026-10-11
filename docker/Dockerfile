@@ -142,6 +142,10 @@ ENV ERROR_LEVEL=warn
 # nginx access log. Off by default because it shares stdout with the download
 # progress and the model load; ACCESS_LOG=on, or a path, turns it back on.
 ENV ACCESS_LOG=off
+# nginx workers. Deliberately a small number rather than "auto": a rented host
+# can expose 200+ cores and auto forks one worker per core, which is hundreds of
+# processes and several GB of RSS to proxy a single upstream.
+ENV WORKER_PROCESSES=4
 ENV DOWNLOAD_ATTEMPTS=20
 # How long llama-server has to stay up before a later exit counts as a real
 # crash rather than a bad fit. Under this, the entrypoint retries on the same

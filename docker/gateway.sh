@@ -41,6 +41,7 @@ ERROR_LEVEL="${ERROR_LEVEL:-warn}"
 # download or a model load in access lines, so this is off unless asked for.
 # "on" means /dev/stdout; any other value is passed to nginx as written, so a
 # path works too.
+WORKER_PROCESSES="${WORKER_PROCESSES:-4}"
 ACCESS_LOG="${ACCESS_LOG:-off}"
 case "$ACCESS_LOG" in
     on|1|true|yes) ACCESS_LOG=/dev/stdout ;;
@@ -95,6 +96,7 @@ sed -e "s#__NJS_MODULE__#${NJS_MODULE}#g" \
     -e "s#__MAX_UPLOAD_SIZE__#${MAX_UPLOAD_SIZE}#g" \
     -e "s#__ERROR_LEVEL__#${ERROR_LEVEL}#g" \
     -e "s#__ACCESS_LOG__#${ACCESS_LOG}#g" \
+    -e "s#__WORKER_PROCESSES__#${WORKER_PROCESSES}#g" \
     /etc/glm53f/nginx.conf.template > "$CONF"
 
 if grep -q '__[A-Z_]*__' "$CONF"; then

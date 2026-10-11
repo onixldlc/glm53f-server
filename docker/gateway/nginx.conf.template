@@ -33,7 +33,12 @@ load_module __NJS_MODULE__;
 # uploads volume. A worker running as nginx:nginx could not write alongside it,
 # and these workers do nothing but move files on that volume.
 user root;
-worker_processes auto;
+# NOT auto. A Vast host can expose 200+ cores, and "auto" then forks one worker
+# per core: ~230 nginx processes, each with its own listen socket and connection
+# pool, for a proxy with ONE upstream and a file manager. It works, and it costs
+# several GB of RSS and a process table nobody can read. Four workers x 1024
+# connections is already far more than a single llama-server can be fed.
+worker_processes __WORKER_PROCESSES__;
 pid /run/nginx.pid;
 
 error_log /dev/stderr __ERROR_LEVEL__;
