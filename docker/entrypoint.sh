@@ -18,8 +18,50 @@ mkdir -p "$MODEL_DIR"
 # /manage/ answers for the whole of a first run's 87-272 GiB download while /
 # returns 502 until the model is actually up. It is daemonised, so the container
 # still lives and dies with llama-server below.
+LISTEN_PORT="${LISTEN_PORT:-8080}"
+GATEWAY_WAIT="${GATEWAY_WAIT:-10}"
+GATEWAY_FALLBACK="${GATEWAY_FALLBACK:-1}"
+
 if [ "${GATEWAY_ENABLE:-1}" = "1" ]; then
-    /usr/local/bin/gateway.sh start
+    /usr/local/bin/gateway.sh start || true
+
+    # Starting nginx is not the same as nginx serving, and a published port with
+    # nothing behind it is the worst failure this image has: the tunnel to
+    # :LISTEN_PORT connects and then answers nothing, while llama-server sits
+    # there working on :PORT. So the front door is asked whether it is actually
+    # open, and told to get out of the way if it is not.
+    gateway_ok=0
+    waited=0
+    while [ "$waited" -lt "$GATEWAY_WAIT" ]; do
+        if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${LISTEN_PORT}/manage/health" 2>/dev/null; then
+            gateway_ok=1
+            break
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+
+    if [ "$gateway_ok" = "1" ]; then
+        log "front door open: http://0.0.0.0:${LISTEN_PORT} -> llama-server on 127.0.0.1:${PORT}"
+    else
+        log "FAILED the gateway did not answer on :${LISTEN_PORT} within ${GATEWAY_WAIT}s"
+        if command -v ss >/dev/null 2>&1; then
+            ss -lntp 2>/dev/null | awk -v p=":${LISTEN_PORT}\$" '$4 ~ p { print "  port held by: " $0 }'
+        fi
+        if [ "$GATEWAY_FALLBACK" = "1" ]; then
+            # Better a working API on the published port than a dead port and a
+            # file manager nobody can reach.
+            log "  falling back: llama-server takes :${LISTEN_PORT} itself, no /manage/"
+            log "  (set GATEWAY_FALLBACK=0 to keep the gateway and fail loudly instead)"
+            nginx -s stop 2>/dev/null || pkill -x nginx 2>/dev/null || true
+            sleep 1
+            HOST=0.0.0.0
+            PORT="$LISTEN_PORT"
+        else
+            log "  GATEWAY_FALLBACK=0, leaving it: :${LISTEN_PORT} stays dead and"
+            log "  llama-server will serve on ${HOST}:${PORT} only"
+        fi
+    fi
 else
     log "gateway disabled: llama-server is the only listener, on ${HOST}:${PORT}"
     log "  nothing serves /manage/ — set HOST=0.0.0.0 PORT=8080 to publish it directly"
@@ -449,15 +491,17 @@ fi
 # MCP servers are a different set: 'files' lists and extracts uploads, 'web'
 # searches. Neither reads a file the model names.
 #
-# Default is the file set. exec_shell_command is deliberately NOT in it — it is
-# a shell on the box reachable from any chat message that gets through the front
-# door. TOOLS=all turns on everything including that; TOOLS= disables the lot.
+# Default is "all", which is every tool llama.cpp has INCLUDING
+# exec_shell_command — a shell on this box, reachable from any chat message that
+# gets through the front door. That is the point of this image: a model that can
+# work on what you upload. Keep the port private. TOOLS= disables the lot, and a
+# comma list picks individual ones.
 #
 # Available in b11461: read_file, file_glob_search, grep_search,
 # exec_shell_command, write_file, edit_file, get_info.
 # No colon: TOOLS= set to an empty value means "no tools", while unset means
 # the default. ${TOOLS:-...} would ignore the difference and re-enable them.
-TOOLS="${TOOLS-read_file,file_glob_search,grep_search,write_file,edit_file,get_info}"
+TOOLS="${TOOLS-all}"
 
 tools_set=0
 case " ${EXTRA_ARGS} " in

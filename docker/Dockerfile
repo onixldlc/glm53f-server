@@ -147,6 +147,13 @@ ENV DOWNLOAD_ATTEMPTS=20
 # crash rather than a bad fit. Under this, the entrypoint retries on the same
 # weights with a smaller KV type and context (see entrypoint.sh).
 ENV GRACE_SECONDS=180
+# Seconds to wait for the gateway to answer on LISTEN_PORT before deciding it is
+# not going to, and what to do then. A published port with nothing behind it is
+# the worst failure this image has — the tunnel connects and answers nothing —
+# so by default llama-server takes the port itself rather than leaving it dead.
+# GATEWAY_FALLBACK=0 keeps the gateway and fails loudly instead.
+ENV GATEWAY_WAIT=10
+ENV GATEWAY_FALLBACK=1
 ENV EXTRA_ARGS=
 # Tool servers, off by default. 1 renders the MCP config and hands llama-server
 # --mcp-servers-config. Which servers that config ends up holding is the two
@@ -167,14 +174,14 @@ ENV HTTP_TIMEOUT=20
 # path mcp-files reports is already relative to what the built-in file tools
 # resolve against — that is the whole trick, and changing one without the other
 # breaks it.
-# llama.cpp's built-in tools, comma separated, passed as --tools. Its own
-# default is NO tools, which leaves the model unable to read the workspace this
-# image mounts for it. exec_shell_command is left out on purpose: it is a shell
-# on this host, reachable from any chat message. TOOLS=all enables everything,
-# TOOLS= disables them.
+# llama.cpp's built-in tools, passed as --tools. Its own default is NO tools,
+# which leaves the model unable to read the workspace this image mounts for it.
+# "all" includes exec_shell_command, a shell on this host reachable from any
+# chat message that gets through the front door — keep the port private.
+# TOOLS= disables them, and a comma list picks individual ones.
 # b11461 offers: read_file, file_glob_search, grep_search, exec_shell_command,
 # write_file, edit_file, get_info.
-ENV TOOLS=read_file,file_glob_search,grep_search,write_file,edit_file,get_info
+ENV TOOLS=all
 
 ENV UPLOADS_WORKSPACE=/workspace
 ENV INBOX_SUBDIR=inbox

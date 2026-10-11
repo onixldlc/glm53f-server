@@ -569,14 +569,20 @@ Two different sets, and they are easy to confuse:
   it. Paths it returns are relative to `/workspace`, which is `WORKDIR`, so they
   go straight into `read_file`.
 
-The default leaves `exec_shell_command` out: it runs commands on the host and
-anything that reaches the chat endpoint can call it. `TOOLS=all` enables every
-tool including that one, and the entrypoint warns when it does. `TOOLS=` (empty)
-disables them. `LLAMA_ARG_TOOLS` or a `--tools` in `EXTRA_ARGS` wins over
-`TOOLS`, and the entrypoint says which one it used:
+The default is `TOOLS=all`, which includes `exec_shell_command` — a shell on
+the host, callable by anything that reaches the chat endpoint. That is the point
+of this image: a model that can actually work on what you upload. **Keep the
+port private**: publish it to localhost and tunnel, rather than to 0.0.0.0 on a
+rented box. `TOOLS=` (empty) disables every tool, and a comma list picks
+individual ones, for example
+`TOOLS=read_file,file_glob_search,grep_search,get_info` for read-only work.
+`LLAMA_ARG_TOOLS` or a `--tools` in `EXTRA_ARGS` wins over `TOOLS`, and the
+entrypoint says which one it used:
 
 ```
-[glm53f] built-in tools: read_file,file_glob_search,grep_search,write_file,edit_file,get_info
+[glm53f] built-in tools: all
+[glm53f]   WARNING exec_shell_command is on — any chat message that reaches this
+[glm53f]   server can run commands on this host. Keep the port private.
 ```
 
 Enabling any tool makes llama.cpp clamp `--cors-origins` to localhost. An
