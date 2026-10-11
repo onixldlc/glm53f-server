@@ -93,6 +93,12 @@ ENV VRAM_MIB=
 # autoscale.sh multiplies it by the GPU count, because llama.cpp splits LAYERS
 # across devices and every card needs its own room for compute buffers.
 ENV FIT_MARGIN_MIB=4096
+# Free space to keep on the weights filesystem, in MiB. autoscale.sh sizes the
+# quant to the DISK as well as the cards and refuses to start if nothing fits;
+# the entrypoint also HEADs each shard and will not begin a transfer that would
+# fill the volume. A full filesystem does not just fail the download, it stops
+# everything on the host that needs to write, sshd included.
+ENV DISK_RESERVE_MIB=8192
 # A number, or 'auto' to drop --ctx-size and let llama.cpp's own fitter size the
 # KV pool against free VRAM. Ignored when AUTO_SCALE=1 picks a value.
 # 131072 is the floor autoscale.sh sizes the quant around, not a target: it picks

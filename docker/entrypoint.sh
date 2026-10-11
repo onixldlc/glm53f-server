@@ -9,6 +9,7 @@ set -euo pipefail
 log() { printf '[glm53f] %s\n' "$*"; }
 
 MODEL_DIR="${MODEL_DIR:-/models}"
+DISK_RESERVE_MIB="${DISK_RESERVE_MIB:-8192}"
 mkdir -p "$MODEL_DIR"
 
 # --- front door -------------------------------------------------------------
@@ -34,7 +35,20 @@ FIT_MARGIN_MIB="${FIT_MARGIN_MIB:-4096}"
 AS_KV=""
 
 if [ "$AUTO_SCALE" = "1" ] && [ "${N_GPU_LAYERS:-0}" != "0" ]; then
-    if as_out="$(FIT_MARGIN_MIB="$FIT_MARGIN_MIB" /usr/local/bin/autoscale.sh)"; then
+    set +e
+    as_out="$(FIT_MARGIN_MIB="$FIT_MARGIN_MIB" /usr/local/bin/autoscale.sh)"
+    as_rc=$?
+    set -e
+    # 2 is "no quant fits on this disk", which is fatal: carrying on with the
+    # image default would download until the filesystem is full, and a full
+    # filesystem takes the whole host with it.
+    if [ "$as_rc" = "2" ]; then
+        log "FAILED autoscale refused to start: not enough disk at ${MODEL_DIR}"
+        log "  Nothing has been downloaded. Give the container a bigger disk or"
+        log "  mount a volume there, then start again."
+        exit 2
+    fi
+    if [ "$as_rc" = "0" ]; then
         # autoscale.sh emits plain KEY=VALUE lines and nothing else.
         eval "$as_out"
         AS_KV="$CACHE_TYPE"
@@ -84,6 +98,28 @@ fetch() {
 
     local auth=()
     [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${HF_TOKEN}")
+
+    # Never start a transfer that cannot finish. A download that fills the
+    # filesystem does not just fail: it takes down everything else on the host
+    # that needs to write, sshd included, and on a rented box that means losing
+    # the instance rather than losing the file. The size comes from a HEAD, so
+    # a server that will not answer one simply skips the check.
+    local free_mib size_mib
+    free_mib="$(df -Pm "$(dirname "$dest")" 2>/dev/null | awk 'NR==2 { print $4 + 0 }')" || free_mib=""
+    if [ -n "$free_mib" ] && [ "$free_mib" -gt 0 ] 2>/dev/null; then
+        # A HEAD that fails is not an error here: set -o pipefail would make the
+        # assignment itself fatal, so the size is simply treated as unknown.
+        size_mib="$(curl -fsSLI "${auth[@]}" "$url" 2>/dev/null \
+            | tr -d '\r' \
+            | awk 'tolower($1) == "content-length:" { n = int($2 / 1048576) } END { if (n > 0) print n }')" || size_mib=""
+        if [ -n "$size_mib" ] && [ $(( size_mib + DISK_RESERVE_MIB )) -gt "$free_mib" ]; then
+            log "FAILED ${file} needs ${size_mib} MiB and only ${free_mib} MiB is free at ${MODEL_DIR}"
+            log "  (keeping ${DISK_RESERVE_MIB} MiB in reserve). Refusing to start the transfer:"
+            log "  filling this filesystem would take the host down with it, sshd included."
+            log "  Give the container a bigger disk, or mount a volume at ${MODEL_DIR}."
+            return 1
+        fi
+    fi
 
     while [ "$attempt" -le "${DOWNLOAD_ATTEMPTS}" ]; do
         log "downloading ${file} (attempt ${attempt}/${DOWNLOAD_ATTEMPTS})"

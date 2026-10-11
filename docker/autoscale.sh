@@ -29,6 +29,12 @@ FIT_MARGIN_MIB="${FIT_MARGIN_MIB:-4096}"
 N_DEVICES="${N_DEVICES:-}"
 MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_PREFIX="${MODEL_PREFIX:-GLM-5.3-Flash}"
+# Free space to leave on the weights filesystem, MiB. A quant is sized to fit
+# the DISK as well as the VRAM: filling the volume does not just fail the
+# download, it takes the whole host down with it — on a rented box with the
+# weights on the container disk, a full filesystem means sshd cannot even open
+# a session any more.
+DISK_RESERVE_MIB="${DISK_RESERVE_MIB:-8192}"
 MMPROJ_MIB=1110
 # GLM-5.3-Flash is a 1M-context model, but nothing here reaches for that: the
 # context is pinned to CTX_TARGET and the quant is chosen around it.
@@ -53,6 +59,18 @@ detect_vram_mib() {
     command -v nvidia-smi >/dev/null 2>&1 || return 1
     nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
         | awk '{ t += $1 + 0 } END { if (t > 0) print int(t); else exit 1 }'
+}
+
+# What the weights filesystem can still take, in MiB: what is free right now,
+# plus whatever this directory already holds (a re-run on a volume that already
+# has the shards must not count them as missing space).
+detect_disk_budget_mib() {
+    local free used
+    free="$(df -Pm "$MODEL_DIR" 2>/dev/null | awk 'NR==2 { print $4 + 0 }')" || return 1
+    [ -n "$free" ] || return 1
+    used="$(du -sm "$MODEL_DIR" 2>/dev/null | awk '{ print $1 + 0 }')"
+    [ -n "$used" ] || used=0
+    printf '%s' $(( free + used ))
 }
 
 detect_device_count() {
@@ -89,10 +107,24 @@ UD-Q6_K_XL:7:278314
 #
 # The margin is multiplied by the device count: a 2-card host must keep
 # FIT_MARGIN_MIB free on EACH card, so 2x that much of the total is unusable.
+# VRAM cost of everything that is not the weights, expressed against the TOTAL
+# pool so it can be compared with VRAM_MIB in one subtraction.
+#
+# Both terms that look over-counted are deliberate:
+#   * the margin is per device, so it multiplies by N_DEVICES;
+#   * so does the vision tower, because llama.cpp puts it on device 0 alone
+#     while it splits the layers evenly. The condition that actually has to
+#     hold is per device,
+#         (weights + kv) / N + mmproj + margin <= VRAM / N
+#     and multiplying it out by N gives
+#         weights + kv + N*mmproj + N*margin <= VRAM
+#     which is what this returns. Charging mmproj once was what left device 0
+#     short: 4718 MiB free per device on an 8-card box reads fine, but 1110 of
+#     those MiB only existed on the other seven cards.
 overhead_mib() {
     local per_1k="$1"
     local o=$(( FIT_MARGIN_MIB * N_DEVICES + (CTX_TARGET / 1024) * per_1k ))
-    [ "$ENABLE_VISION" = "1" ] && o=$(( o + MMPROJ_MIB ))
+    [ "$ENABLE_VISION" = "1" ] && o=$(( o + MMPROJ_MIB * N_DEVICES ))
     printf '%s' "$o"
 }
 
@@ -109,12 +141,22 @@ pick_for_vram() {
     o_f16="$(overhead_mib "$KV_MIB_PER_1K_F16")"
     o_q8="$(overhead_mib "$KV_MIB_PER_1K_Q8")"
 
+    # What one quant costs on DISK: its shards, plus the vision tower, plus the
+    # reserve. Unrelated to the VRAM budget — a host can have the cards for a
+    # quant and nowhere to put the file.
+    local disk_extra=$(( DISK_RESERVE_MIB ))
+    [ "$ENABLE_VISION" = "1" ] && disk_extra=$(( disk_extra + MMPROJ_MIB ))
+
     quant=""
     for row in $QUANTS; do
         local q="${row%%:*}"
         local rest="${row#*:}"
         local sh="${rest%%:*}"
         local w="${rest#*:}"
+        if [ "$DISK_BUDGET_MIB" -gt 0 ] && [ $(( w + disk_extra )) -gt "$DISK_BUDGET_MIB" ]; then
+            [ -z "$DISK_CAPPED" ] && DISK_CAPPED="$q"
+            continue
+        fi
         if [ $(( w + o_q8 )) -le "$vram_mib" ]; then
             quant="$q"; shards="$sh"; weights_mib="$w"
             if [ $(( w + o_f16 )) -le "$vram_mib" ]; then
@@ -128,6 +170,18 @@ pick_for_vram() {
             break
         fi
     done
+
+    # Not even the smallest quant fits on the filesystem. Downloading anything
+    # here ends with a full disk, so this is fatal rather than a warning.
+    if [ -z "$quant" ] && [ "$DISK_BUDGET_MIB" -gt 0 ] \
+       && [ $(( 88775 + disk_extra )) -gt "$DISK_BUDGET_MIB" ]; then
+        say "FAILED ${DISK_BUDGET_MIB} MiB of disk at ${MODEL_DIR} is not enough for any quant."
+        say "  Smallest is UD-IQ1_S at 88775 MiB + ${disk_extra} MiB of mmproj and reserve."
+        say "  Give the container a bigger disk, or mount a volume at ${MODEL_DIR}."
+        say "  Refusing to start: a download that fills this filesystem takes the host"
+        say "  down with it, sshd included."
+        exit 2
+    fi
 
     # Nothing holds CTX_TARGET, not even the smallest quant with q8_0 KV.
     if [ -z "$quant" ]; then
@@ -186,8 +240,23 @@ if [ -z "$N_DEVICES" ]; then
 fi
 [ "$N_DEVICES" -ge 1 ] 2>/dev/null || N_DEVICES=1
 
+DISK_BUDGET_MIB="${DISK_BUDGET_MIB:-}"
+DISK_CAPPED=""
+if [ -z "$DISK_BUDGET_MIB" ]; then
+    DISK_BUDGET_MIB="$(detect_disk_budget_mib)" || DISK_BUDGET_MIB=0
+fi
+[ "$DISK_BUDGET_MIB" -ge 0 ] 2>/dev/null || DISK_BUDGET_MIB=0
+if [ "$DISK_BUDGET_MIB" = "0" ]; then
+    say "cannot read free space at ${MODEL_DIR}; choosing on VRAM alone"
+fi
+
 pick_for_vram "$VRAM_MIB"
 SOURCE=table
+
+if [ -n "$DISK_CAPPED" ]; then
+    say "disk capped the choice: ${DISK_CAPPED} and larger do not fit in"
+    say "  ${DISK_BUDGET_MIB} MiB at ${MODEL_DIR} (keeping ${DISK_RESERVE_MIB} MiB free)"
+fi
 
 if [ "${1:-}" = "--measure" ] && measure; then
     SOURCE=llama-fit-params
@@ -196,26 +265,38 @@ fi
 per_1k="$KV_MIB_PER_1K_F16"
 [ "$CACHE_TYPE" = "q8_0" ] && per_1k="$KV_MIB_PER_1K_Q8"
 kv_mib=$(( CTX_SIZE / 1024 * per_1k ))
-used_mib=$(( WEIGHTS_MIB + kv_mib ))
-[ "$ENABLE_VISION" = "1" ] && used_mib=$(( used_mib + MMPROJ_MIB ))
+mm_mib=0
+[ "$ENABLE_VISION" = "1" ] && mm_mib="$MMPROJ_MIB"
+used_mib=$(( WEIGHTS_MIB + kv_mib + mm_mib ))
 
+# Reported per device, because that is the number that decides whether the load
+# survives. The layers and their KV split evenly; the vision tower does not, it
+# sits on device 0, so device 0 is the one that runs out first.
+vram_per_dev=$(( VRAM_MIB / N_DEVICES ))
+used_per_dev=$(( (WEIGHTS_MIB + kv_mib) / N_DEVICES ))
 free_mib=$(( VRAM_MIB - used_mib ))
-free_per_dev=$(( free_mib / N_DEVICES ))
+free_per_dev=$(( vram_per_dev - used_per_dev ))
+free_dev0=$(( free_per_dev - mm_mib ))
 
 say "${VRAM_MIB} MiB over ${N_DEVICES} device(s) -> ${MODEL_QUANT} (${MODEL_SHARDS} shards) + ${CTX_SIZE} ctx @ ${CACHE_TYPE} KV, needs ${TIER} GiB"
-say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + mmproj $([ "$ENABLE_VISION" = "1" ] && echo $MMPROJ_MIB || echo 0) MiB = ${used_mib} MiB"
-say "  free ${free_mib} MiB total = ~${free_per_dev} MiB per device (reserve ${FIT_MARGIN_MIB}/device)"
+say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + mmproj ${mm_mib} MiB = ${used_mib} MiB of ${VRAM_MIB} MiB"
+if [ "$N_DEVICES" -gt 1 ] && [ "$mm_mib" -gt 0 ]; then
+    say "  free ~${free_per_dev} MiB per device, ${free_dev0} MiB on device 0 (it holds the"
+    say "  vision tower) — reserve is ${FIT_MARGIN_MIB} MiB per device"
+else
+    say "  free ${free_mib} MiB total = ~${free_dev0} MiB per device (reserve ${FIT_MARGIN_MIB}/device)"
+fi
 
-# llama.cpp splits LAYERS, so what matters is the per-device figure. Anything
-# under the reserve means the compute buffers have nowhere to go and the load
-# dies after the weights are already on the cards.
-if [ "$free_per_dev" -lt "$FIT_MARGIN_MIB" ]; then
-    say "WARNING only ${free_per_dev} MiB free per device, under the ${FIT_MARGIN_MIB} MiB reserve."
+# Anything under the reserve on the WORST device means the compute buffers have
+# nowhere to go and the load dies after the weights are already on the cards.
+if [ "$free_dev0" -lt "$FIT_MARGIN_MIB" ]; then
+    say "WARNING only ${free_dev0} MiB free on device 0, under the ${FIT_MARGIN_MIB} MiB reserve."
     say "  Raise FIT_MARGIN_MIB, lower CTX_TARGET, or expect an out-of-memory abort."
 fi
 
 printf 'VRAM_MIB=%s\n'     "$VRAM_MIB"
 printf 'N_DEVICES=%s\n'    "$N_DEVICES"
+printf 'DISK_BUDGET_MIB=%s\n' "$DISK_BUDGET_MIB"
 printf 'TIER=%s\n'         "$TIER"
 printf 'MODEL_FILE=%s\n'   "$MODEL_FILE"
 printf 'MODEL_QUANT=%s\n'  "$MODEL_QUANT"

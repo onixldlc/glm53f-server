@@ -402,17 +402,45 @@ to f16 if f16 also fits. That order matters: a bigger quant at `q8_0` beats a sm
 `f16`, because the KV type costs far less quality than a whole quant step. Trying f16 first did
 the opposite — it spent 3840 MiB on the KV type and then had to drop a quant to pay for it.
 
+### The vision tower is not split either
+
+llama.cpp spreads the layers and their KV evenly, but the mmproj goes on **device 0 alone**.
+So the condition that has to hold is per device:
+
+```
+(weights + kv) / N + mmproj + margin  <=  VRAM / N
+```
+
+which, multiplied out, is `weights + kv + N*mmproj + N*margin <= VRAM`. Both the margin **and
+the vision tower** multiply by the card count. Charging the 1110 MiB tower once to the pool is
+what left device 0 short on the 8-card box: `free ~4718 MiB per device` read fine, but 1110 of
+those MiB only existed on the other seven cards. `autoscale.sh` now reports device 0 separately,
+because device 0 is the card that runs out first:
+
+```
+[autoscale] 196608 MiB over 8 device(s) -> UD-IQ4_XS (5 shards) + 131072 ctx @ q8_0 KV, needs 190 GiB
+[autoscale]   weights 149557 MiB + kv 4352 MiB + mmproj 1110 MiB = 155019 MiB of 196608 MiB
+[autoscale]   free ~5338 MiB per device, 4228 MiB on device 0 (it holds the
+[autoscale]   vision tower) — reserve is 4096 MiB per device
+```
+
 What that buys in practice:
 
-| Host | Total VRAM | Cards | Picks | KV | Free per card |
+| Host | Total VRAM | Cards | Picks | KV | Free on device 0 |
 |---|---|---|---|---|---|
-| 4x A100-80 | 327680 MiB | 4 | `UD-Q6_K_XL` | f16 | 10016 MiB |
-| 2x H200-141 | 288768 MiB | 2 | `UD-Q5_K_XL` | f16 | 25146 MiB |
-| 8x RTX 5090 | 260856 MiB | 8 | `UD-Q4_K_XL` | f16 | 7637 MiB |
-| **2x A100-80** | **163840 MiB** | 2 | **`UD-IQ4_XS`** | **q8_0** | 4410 MiB |
+| 4x A100-80 | 327680 MiB | 4 | `UD-Q6_K_XL` | f16 | 9184 MiB |
+| 2x H200-141 | 288768 MiB | 2 | `UD-Q5_K_XL` | f16 | 24591 MiB |
+| 8x RTX 5090 | 260856 MiB | 8 | `UD-Q4_K_XL` | f16 | 6666 MiB |
+| **8x RTX 4090** | **196608 MiB** | 8 | **`UD-IQ4_XS`** | **q8_0** | 4228 MiB |
+| 2x A100-80 | 163840 MiB | 2 | `UD-Q3_K_XL` | f16 | 6364 MiB |
 | 1x H200-141 | 144384 MiB | 1 | `UD-IQ3_XXS` | f16 | 20291 MiB |
-| 4x RTX 5090 | 130428 MiB | 4 | `UD-Q2_K_XL` | f16 | 4360 MiB |
+| 4x RTX 5090 | 130428 MiB | 4 | `UD-Q2_K_XL` | q8_0 | 4488 MiB |
 | 3x RTX 5090 | 97821 MiB | 3 | `UD-IQ1_S` | q8_0 | **does not fit** |
+
+The 8-card row is the one to read: `UD-IQ4_XS` is kept, but at `q8_0` KV, which leaves device 0
+4228 MiB — over the reserve by 132 MiB. With the tower charged once it took f16 KV instead, and
+device 0 was left ~3600 MiB, under its own reserve. That is a load that dies after the weights
+are already resident.
 
 **There is a floor, and it is high.** Once each card keeps its reserve, 3x RTX 5090 holds
 nothing at 128K. `autoscale.sh` says so loudly rather than quietly shrinking your context:
@@ -422,6 +450,60 @@ nothing at 128K. `autoscale.sh` says so loudly rather than quietly shrinking you
 [autoscale]   Smallest is UD-IQ1_S + q8_0 KV = 106525 MiB. Layers will spill to
 [autoscale]   host RAM; drop N_GPU_LAYERS, lower CTX_TARGET, or rent more VRAM.
 ```
+
+### The disk is a budget too, and filling it takes the host with it
+
+A host can have the cards for a quant and nowhere to put the file. That is not a download
+failure — on a rented box with the weights on the container disk, a **full filesystem stops
+everything that needs to write, sshd included**, and the instance is gone rather than the file.
+
+So `autoscale.sh` reads `df` at `MODEL_DIR` and sizes the quant to the disk as well as the VRAM,
+keeping `DISK_RESERVE_MIB` (8192) free. A re-run counts what the directory already holds, so
+existing shards are not mistaken for missing space.
+
+Mind that **quants are quoted in GiB and disks are sold in GB** — a factor of 1.074 that is
+large enough to turn "it fits" into a dead instance. `UD-IQ4_XS` is 146.05 GiB, which is
+**156.8 GB**: a 150 GB container disk cannot hold it.
+
+| Quant | Weights | = GB | Container disk to ask for |
+|---|---|---|---|
+| `UD-Q6_K_XL` | 271.79 GiB | 291.9 GB | 320 GB |
+| `UD-Q5_K_XL` | 223.80 GiB | 240.3 GB | 270 GB |
+| `UD-Q4_K_XL` | 185.99 GiB | 199.7 GB | 230 GB |
+| **`UD-IQ4_XS`** | **146.05 GiB** | **156.8 GB** | **200 GB** |
+| `UD-Q3_K_XL` | 137.40 GiB | 147.5 GB | 170 GB |
+| `UD-IQ3_XXS` | 112.10 GiB | 120.4 GB | 150 GB |
+| `UD-Q2_K_XL` | 101.25 GiB | 108.7 GB | 130 GB |
+| `UD-IQ2_XXS` | 94.85 GiB | 101.9 GB | 130 GB |
+| `UD-IQ1_M` | 90.88 GiB | 97.6 GB | 120 GB |
+| `UD-IQ1_S` | 86.69 GiB | 93.1 GB | 120 GB |
+
+The last column is weights + the 1.08 GB vision tower + the 8 GiB reserve, rounded up to a size
+you can actually rent.
+
+Given a disk, the quant steps down to fit it and says so:
+
+```
+[autoscale] disk capped the choice: UD-Q6_K_XL and larger do not fit in
+[autoscale]   143051 MiB at /models (keeping 8192 MiB free)
+[autoscale] 196608 MiB over 8 device(s) -> UD-IQ3_XXS (4 shards) + 131072 ctx @ f16 KV, needs 160 GiB
+```
+
+If not even `UD-IQ1_S` fits, it refuses to start rather than downloading into a wall — before a
+single byte is fetched, exit code 2:
+
+```
+[autoscale] FAILED 38146 MiB of disk at /models is not enough for any quant.
+[autoscale]   Smallest is UD-IQ1_S at 88775 MiB + 9302 MiB of mmproj and reserve.
+[autoscale]   Give the container a bigger disk, or mount a volume at /models.
+[autoscale]   Refusing to start: a download that fills this filesystem takes the host
+[autoscale]   down with it, sshd included.
+```
+
+Each shard is checked individually as well: the entrypoint `HEAD`s the URL and compares the
+`Content-Length` with what is free, so a disk that fills up mid-quant stops at the file boundary
+instead of at the last byte of free space. A server that will not answer a `HEAD` just skips
+that check.
 
 ### When the table is still wrong
 
@@ -436,7 +518,7 @@ within `GRACE_SECONDS` (180), it is restarted on the **same weights** with:
 2. `q8_0` KV at half context
 3. `q8_0` KV at a quarter
 
-Nothing is re-downloaded — a retry costs seconds, not another 150 GB. If it stayed up past the
+Nothing is re-downloaded — a retry costs seconds, not another 157 GB. If it stayed up past the
 grace period and then exited, that is a real crash, not a sizing problem, and it is not retried.
 When every rung fails the entrypoint stops nginx too, so the container exits instead of serving
 `/manage/` and a permanent 502 while looking alive.
@@ -593,14 +675,21 @@ Support for this architecture is only days old, so a newer tag may carry `glm5-n
 There is no "run it on the card you have" option here. Practical configurations, cheapest
 first, with what `autoscale.sh` picks for each:
 
-| Host | Total VRAM | Tier | Quant | Notes |
-|---|---|---|---|---|
-| 3x RTX 5090 | 97821 MiB | 88 | `UD-IQ1_S` | works, but 1-bit — not worth it |
-| 4x RTX 5090 | 130428 MiB | 128 | `UD-IQ3_XXS` | the cheap sweet spot |
-| 1x H200-141 | 144384 MiB | 128 | `UD-IQ3_XXS` | single card, no interconnect to worry about |
-| **2x A100-80** | **163840 MiB** | **160** | **`UD-IQ4_XS`** | **best quality per dollar** |
-| 2x H100-80 | 163840 MiB | 160 | `UD-IQ4_XS` | faster than A100, costs more |
-| 8x RTX 5090 | 260856 MiB | 240 | `UD-Q5_K_XL` | diminishing returns above IQ4 |
+| Host | Total VRAM | Quant | KV | Disk | Notes |
+|---|---|---|---|---|---|
+| 3x RTX 5090 | 97821 MiB | `UD-IQ1_S` | q8_0 | 120 GB | does not hold 128K — see the floor above |
+| 4x RTX 5090 | 130428 MiB | `UD-Q2_K_XL` | q8_0 | 130 GB | the cheap floor that actually runs |
+| 1x H200-141 | 144384 MiB | `UD-IQ3_XXS` | f16 | 150 GB | single card, no interconnect to worry about |
+| **2x A100-80** | **163840 MiB** | **`UD-Q3_K_XL`** | **f16** | **170 GB** | **best quality per dollar** |
+| 2x H100-80 | 163840 MiB | `UD-Q3_K_XL` | f16 | 170 GB | faster than A100, costs more |
+| 8x RTX 4090 | 196608 MiB | `UD-IQ4_XS` | q8_0 | 200 GB | 8 cards, so 8x4096 of reserve + the tower on card 0 |
+| 8x RTX 5090 | 260856 MiB | `UD-Q4_K_XL` | f16 | 230 GB | diminishing returns above IQ4 |
+| 4x A100-80 | 327680 MiB | `UD-Q6_K_XL` | f16 | 320 GB | as good as this image goes |
+
+**Size the container disk from that column, not from the GiB figure.** Every row is a real
+`autoscale.sh` run, and the disk column is weights + tower + reserve converted to the GB the
+host is actually sold in. A 150 GB disk against a 146.05 GiB quant is 157 GB of file in 150 GB
+of space, and what you lose is the whole instance, not the download.
 
 A note on topology: llama.cpp **layer-splits** rather than tensor-paralleling, so each token
 walks the layers in sequence across devices and you get roughly one card's memory bandwidth,
