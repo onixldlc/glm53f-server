@@ -46,7 +46,10 @@ http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
-    access_log  /dev/stdout;
+    # Off by default. nginx and the entrypoint share one terminal, so a UI
+    # polling /props once a second buries the download progress and the model
+    # load behind hundreds of access lines. ACCESS_LOG=on brings it back.
+    access_log  __ACCESS_LOG__;
 
     sendfile           on;
     tcp_nopush         on;
@@ -170,6 +173,17 @@ http {
             proxy_connect_timeout 75s;
             proxy_send_timeout    3600s;
             proxy_read_timeout    3600s;
+
+            # llama-server does not open its port until the weights are read,
+            # which for a 146 GiB quant is minutes. A bare 502 reads like a
+            # broken gateway; say what is actually happening instead.
+            proxy_intercept_errors on;
+            error_page 502 504 = @loading;
+        }
+
+        location @loading {
+            default_type application/json;
+            return 503 '{"error":{"code":503,"type":"unavailable","message":"llama-server is still loading the model — this takes minutes for a large quant. Watch the container log, or poll /health."}}';
         }
     }
 }

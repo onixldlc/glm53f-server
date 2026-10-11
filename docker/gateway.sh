@@ -36,6 +36,15 @@ EXTRACT_SUBDIR="${EXTRACT_SUBDIR:-extracted}"
 UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
 MAX_UPLOAD_SIZE="${MAX_UPLOAD_SIZE:-8g}"
 ERROR_LEVEL="${ERROR_LEVEL:-warn}"
+# nginx shares stdout with the entrypoint and with llama-server. A browser
+# sitting on the WebUI polls /props every second, which is enough to bury a
+# download or a model load in access lines, so this is off unless asked for.
+# "on" means /dev/stdout; any other value is passed to nginx as written, so a
+# path works too.
+ACCESS_LOG="${ACCESS_LOG:-off}"
+case "$ACCESS_LOG" in
+    on|1|true|yes) ACCESS_LOG=/dev/stdout ;;
+esac
 # Debian/Ubuntu's libnginx-mod-http-js lands here. The path is in the config
 # rather than behind an include so a missing module fails at `nginx -t` instead
 # of silently skipping every /manage/ route.
@@ -85,6 +94,7 @@ sed -e "s#__NJS_MODULE__#${NJS_MODULE}#g" \
     -e "s#__UPLOAD_TOKEN__#${UPLOAD_TOKEN}#g" \
     -e "s#__MAX_UPLOAD_SIZE__#${MAX_UPLOAD_SIZE}#g" \
     -e "s#__ERROR_LEVEL__#${ERROR_LEVEL}#g" \
+    -e "s#__ACCESS_LOG__#${ACCESS_LOG}#g" \
     /etc/glm53f/nginx.conf.template > "$CONF"
 
 if grep -q '__[A-Z_]*__' "$CONF"; then

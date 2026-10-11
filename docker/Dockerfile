@@ -139,6 +139,9 @@ ENV PORT=8081
 ENV UPLOAD_TOKEN=
 ENV MAX_UPLOAD_SIZE=8g
 ENV ERROR_LEVEL=warn
+# nginx access log. Off by default because it shares stdout with the download
+# progress and the model load; ACCESS_LOG=on, or a path, turns it back on.
+ENV ACCESS_LOG=off
 ENV DOWNLOAD_ATTEMPTS=20
 # How long llama-server has to stay up before a later exit counts as a real
 # crash rather than a bad fit. Under this, the entrypoint retries on the same
