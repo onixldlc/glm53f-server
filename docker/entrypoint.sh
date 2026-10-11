@@ -508,9 +508,19 @@ case " ${EXTRA_ARGS} " in
     *" --tools "*|*" --tools="*) tools_set=1 ;;
 esac
 if [ -n "${LLAMA_ARG_TOOLS:-}" ]; then
-    # llama-server reads this itself, and a flag here would override what the
-    # user asked for.
-    log "built-in tools: from LLAMA_ARG_TOOLS (${LLAMA_ARG_TOOLS})"
+    # Pass the value as a flag rather than leaving llama-server to read the
+    # environment. Trusting the env was a silent failure: the log said
+    # "from LLAMA_ARG_TOOLS (all)", no --tools reached the command line, and the
+    # model answered "I do not have a read_file tool available". The flag is
+    # the same value, so the user's choice is unchanged — it just takes effect.
+    args+=(--tools "$LLAMA_ARG_TOOLS")
+    log "built-in tools: ${LLAMA_ARG_TOOLS} (from LLAMA_ARG_TOOLS)"
+    case ",${LLAMA_ARG_TOOLS}," in
+        *,all,*|*,exec_shell_command,*)
+            log "  WARNING exec_shell_command is on — any chat message that reaches this"
+            log "  server can run commands on this host. Keep the port private."
+            ;;
+    esac
 elif [ "$tools_set" = "1" ]; then
     log "built-in tools: from EXTRA_ARGS"
 elif [ -n "$TOOLS" ]; then

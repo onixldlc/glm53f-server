@@ -576,7 +576,11 @@ port private**: publish it to localhost and tunnel, rather than to 0.0.0.0 on a
 rented box. `TOOLS=` (empty) disables every tool, and a comma list picks
 individual ones, for example
 `TOOLS=read_file,file_glob_search,grep_search,get_info` for read-only work.
-`LLAMA_ARG_TOOLS` or a `--tools` in `EXTRA_ARGS` wins over `TOOLS`, and the
+`LLAMA_ARG_TOOLS` or a `--tools` in `EXTRA_ARGS` wins over `TOOLS`. An
+`LLAMA_ARG_TOOLS` value is passed on as a `--tools` flag rather than left for
+llama-server to read out of the environment: the environment route fails
+silently, with the log claiming the tools are on, no flag on the command line,
+and the model replying that it has no `read_file` tool. The
 entrypoint says which one it used:
 
 ```
