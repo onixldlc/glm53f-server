@@ -143,9 +143,17 @@ http {
             add_header Content-Disposition "attachment";
         }
 
+        # /manage, and the near-misses people actually type. Without these the
+        # request falls through to the proxy and llama-server answers its own
+        # 404 JSON, which reads as if the gateway is not there at all.
         location = /manage {
             return 302 /manage/;
         }
+
+        location = /manager  { return 302 /manage/; }
+        location = /manager/ { return 302 /manage/; }
+        location = /files    { return 302 /manage/; }
+        location = /upload   { return 302 /manage/; }
 
         # The page itself. Longest-prefix, so it only catches what the exact
         # matches above did not.
