@@ -505,6 +505,56 @@ Each shard is checked individually as well: the entrypoint `HEAD`s the URL and c
 instead of at the last byte of free space. A server that will not answer a `HEAD` just skips
 that check.
 
+### How long the download takes, and how to make it shorter
+
+On a rented box the download runs on the GPU clock: Vast bills the card rate for
+every minute the instance is up, whatever the cards are doing. So the entrypoint
+prices the job before starting it, and reports progress against that total:
+
+```
+[glm53f] model is sharded: 5 files
+[glm53f] to fetch: 5 of 5 files, 156.8 GB total
+[glm53f]   at 100 MB/s that is 26m08s, at 250 MB/s 10m27s
+[glm53f]   16 connections per file (DOWNLOAD_CONNS), progress every 30s
+[glm53f] downloading ...-00002-of-00005.gguf — 50.0 GB over 16 connection(s) (attempt 1/1)
+[glm53f] ...-00002-of-00005.gguf: 12.4 GB of 50.0 GB (24%) at 214 MB/s, file 2m55s left, all 8m12s left
+```
+
+`UD-IQ4_XS` is five shards and they are not even:
+
+| shard | GB |
+|---|---|
+| `00001-of-00005` | 0.01 — metadata only, finishes instantly |
+| `00002-of-00005` | 49.99 |
+| `00003-of-00005` | 49.61 |
+| `00004-of-00005` | 49.49 |
+| `00005-of-00005` | 7.73 |
+| **total** | **156.83** |
+
+That first 9 MB shard is why a download can look like it stalled: shard 1 lands in
+a second and then three 50 GB files follow.
+
+**One connection is the bottleneck, not the link.** HF's CDN shapes per
+connection — a single stream lands around 50-200 MB/s no matter what the host's
+`inet_down` says — so the image ships `aria2` and pulls each shard over
+`DOWNLOAD_CONNS` (16) connections. `DOWNLOAD_CONNS=1`, or an image without
+aria2, falls back to single-stream curl. Resume works either way: an interrupted
+transfer continues from the `.part` file rather than starting over.
+
+To see what your host can actually do before trusting a number:
+
+```sh
+U=https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/main/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf
+curl -sL -r 0-2000000000 -o /dev/null -w '1 conn: %{speed_download} B/s\n' "$U"
+```
+
+Divide 156,830,000,000 by that to get seconds for the whole quant.
+
+And once the weights are down: **stop the instance, do not destroy it**. A
+stopped Vast instance keeps its container disk at the storage rate (200 GB is
+about $1.78/day) and starts again with the shards already there. Destroying it
+means paying for the download twice.
+
 ### When the table is still wrong
 
 A table cannot measure compute buffers, and llama.cpp's own fitter — which can — refuses to run

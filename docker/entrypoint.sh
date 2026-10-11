@@ -63,6 +63,90 @@ is_gguf() {
     [ -s "$1" ] && [ "$(head -c 4 "$1" 2>/dev/null)" = "GGUF" ]
 }
 
+# --- download size and ETA ---------------------------------------------------
+#
+# A quant is 87-272 GiB over 3-7 shards, and on a rented box every minute of
+# that download is billed at the full GPU rate. So the log says up front how
+# many bytes are coming and, while they come, how long is left — guessing from
+# a progress bar that restarts at every shard is how a 50 GB file looks stalled.
+
+# Seconds between progress lines. 0 turns them off.
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-30}"
+
+# Connections per file. HF's CDN shapes per connection — one stream tops out
+# around 50-200 MB/s whatever the link does — so a single-stream download of a
+# 50 GB shard wastes billed GPU minutes. aria2 is in the image for this; when
+# it is missing, or DOWNLOAD_CONNS=1, curl does it one stream at a time.
+DOWNLOAD_CONNS="${DOWNLOAD_CONNS:-16}"
+DL_CONNS=1
+if [ "$DOWNLOAD_CONNS" -gt 1 ] 2>/dev/null && command -v aria2c >/dev/null 2>&1; then
+    DL_CONNS="$DOWNLOAD_CONNS"
+fi
+
+# Bytes for the whole job, and bytes already accounted for by finished files.
+# Both 0 when no HEAD answered, which only costs the ETA, not the download.
+DL_TOTAL_BYTES=0
+DL_DONE_BYTES=0
+
+gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1000000000 }'; }
+
+hms() {
+    awk -v s="${1:-0}" 'BEGIN {
+        s = int(s)
+        if (s >= 3600) printf "%dh%02dm", s / 3600, (s % 3600) / 60
+        else if (s >= 60) printf "%dm%02ds", s / 60, s % 60
+        else printf "%ds", s
+    }'
+}
+
+# Content-Length of a URL, in bytes. Empty when the server will not say, which
+# HF does answer but a mirror might not.
+head_bytes() {
+    local a=() out
+    [ -n "${HF_TOKEN:-}" ] && a=(-H "Authorization: Bearer ${HF_TOKEN}")
+    out="$(curl -fsSLI "${a[@]}" "$1" 2>/dev/null \
+        | tr -d '\r' \
+        | awk 'tolower($1) == "content-length:" { n = $2 + 0 } END { if (n > 0) printf "%d", n }')" || out=""
+    printf '%s' "$out"
+}
+
+# Watches a .part file grow and reports rate and ETA, for the file and for the
+# whole job. Runs in the background for the life of one curl; the caller kills
+# it. Averages from the start of the file rather than between samples, because
+# a single slow 30s window on a 50 GB shard is noise, not news.
+progress_watch() {
+    local path="$1" expect="$2" label="$3"
+    local start cur now elapsed rate pct line remain_job
+    start="$(date +%s)"
+    [ "$PROGRESS_INTERVAL" -gt 0 ] 2>/dev/null || return 0
+    while :; do
+        sleep "$PROGRESS_INTERVAL"
+        cur="$(stat -c %s "$path" 2>/dev/null || echo 0)"
+        [ "$cur" -gt 0 ] 2>/dev/null || continue
+        now="$(date +%s)"
+        elapsed=$(( now - start ))
+        [ "$elapsed" -gt 0 ] || continue
+        rate=$(( cur / elapsed ))
+        [ "$rate" -gt 0 ] || continue
+
+        line="${label}: $(gb "$cur") GB"
+        if [ "$expect" -gt 0 ] 2>/dev/null; then
+            pct=$(( cur * 100 / expect ))
+            line="${line} of $(gb "$expect") GB (${pct}%)"
+        fi
+        line="${line} at $(( rate / 1000000 )) MB/s"
+        if [ "$expect" -gt 0 ] 2>/dev/null && [ "$cur" -lt "$expect" ]; then
+            line="${line}, file $(hms $(( (expect - cur) / rate )) ) left"
+        fi
+        if [ "$DL_TOTAL_BYTES" -gt 0 ] 2>/dev/null; then
+            remain_job=$(( DL_TOTAL_BYTES - DL_DONE_BYTES - cur ))
+            [ "$remain_job" -lt 0 ] && remain_job=0
+            line="${line}, all $(hms $(( remain_job / rate )) ) left"
+        fi
+        log "$line"
+    done
+}
+
 fetch() {
     local file="$1"
     local dest="${MODEL_DIR}/${file}"
@@ -104,15 +188,14 @@ fetch() {
     # that needs to write, sshd included, and on a rented box that means losing
     # the instance rather than losing the file. The size comes from a HEAD, so
     # a server that will not answer one simply skips the check.
-    local free_mib size_mib
+    local free_mib size_bytes size_mib
+    size_bytes="$(head_bytes "$url")"
+    [ -n "$size_bytes" ] || size_bytes=0
+
     free_mib="$(df -Pm "$(dirname "$dest")" 2>/dev/null | awk 'NR==2 { print $4 + 0 }')" || free_mib=""
-    if [ -n "$free_mib" ] && [ "$free_mib" -gt 0 ] 2>/dev/null; then
-        # A HEAD that fails is not an error here: set -o pipefail would make the
-        # assignment itself fatal, so the size is simply treated as unknown.
-        size_mib="$(curl -fsSLI "${auth[@]}" "$url" 2>/dev/null \
-            | tr -d '\r' \
-            | awk 'tolower($1) == "content-length:" { n = int($2 / 1048576) } END { if (n > 0) print n }')" || size_mib=""
-        if [ -n "$size_mib" ] && [ $(( size_mib + DISK_RESERVE_MIB )) -gt "$free_mib" ]; then
+    if [ -n "$free_mib" ] && [ "$free_mib" -gt 0 ] 2>/dev/null && [ "$size_bytes" -gt 0 ]; then
+        size_mib=$(( size_bytes / 1048576 ))
+        if [ $(( size_mib + DISK_RESERVE_MIB )) -gt "$free_mib" ]; then
             log "FAILED ${file} needs ${size_mib} MiB and only ${free_mib} MiB is free at ${MODEL_DIR}"
             log "  (keeping ${DISK_RESERVE_MIB} MiB in reserve). Refusing to start the transfer:"
             log "  filling this filesystem would take the host down with it, sshd included."
@@ -121,18 +204,61 @@ fetch() {
         fi
     fi
 
+    local started rc watch_pid=""
     while [ "$attempt" -le "${DOWNLOAD_ATTEMPTS}" ]; do
-        log "downloading ${file} (attempt ${attempt}/${DOWNLOAD_ATTEMPTS})"
-        # -C - resumes from whatever is already in .part, so a stalled transfer
-        # costs only the bytes it had not reached yet.
-        if curl -fL --progress-bar \
+        if [ "$size_bytes" -gt 0 ]; then
+            log "downloading ${file} — $(gb "$size_bytes") GB over ${DL_CONNS} connection(s) (attempt ${attempt}/${DOWNLOAD_ATTEMPTS})"
+        else
+            log "downloading ${file} over ${DL_CONNS} connection(s) (attempt ${attempt}/${DOWNLOAD_ATTEMPTS})"
+        fi
+
+        started="$(date +%s)"
+        progress_watch "$part" "$size_bytes" "$(basename "$file")" &
+        watch_pid=$!
+
+        rc=0
+        if [ "$DL_CONNS" -gt 1 ]; then
+            # aria2 splits the file into ranges and pulls them at once, which is
+            # the only way past HF's per-connection shaping. --continue picks up
+            # a .part left by a previous attempt, aria2's own or curl's.
+            local aria_auth=()
+            [ -n "${HF_TOKEN:-}" ] && aria_auth=(--header="Authorization: Bearer ${HF_TOKEN}")
+            aria2c \
+                --continue=true \
+                --max-connection-per-server="$DL_CONNS" \
+                --split="$DL_CONNS" \
+                --min-split-size=16M \
+                --file-allocation=none \
+                --max-tries=5 --retry-wait=5 --timeout=60 \
+                --lowest-speed-limit=1K \
+                --console-log-level=warn --summary-interval=0 --quiet=true \
+                "${aria_auth[@]}" \
+                --dir="$(dirname "$part")" --out="$(basename "$part")" \
+                "$url" || rc=$?
+        else
+            # -C - resumes from whatever is already in .part, so a stalled transfer
+            # costs only the bytes it had not reached yet.
+            curl -fL -s --show-error \
                 -C - \
                 --retry 5 --retry-delay 5 --retry-all-errors \
                 --speed-limit 1024 --speed-time 60 \
                 "${auth[@]}" \
-                -o "$part" "$url"; then
+                -o "$part" "$url" || rc=$?
+        fi
+
+        kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+
+        if [ "$rc" = "0" ]; then
             mv -f "$part" "$dest"
-            log "done ${file} ($(du -h "$dest" | cut -f1))"
+            local took=$(( $(date +%s) - started ))
+            [ "$took" -lt 1 ] && took=1
+            if [ "$size_bytes" -gt 0 ]; then
+                log "done ${file} — $(gb "$size_bytes") GB in $(hms "$took") at $(( size_bytes / took / 1000000 )) MB/s"
+                DL_DONE_BYTES=$(( DL_DONE_BYTES + size_bytes ))
+            else
+                log "done ${file} ($(du -h "$dest" | cut -f1))"
+            fi
             return 0
         fi
         log "transfer interrupted, resuming in 5s"
@@ -169,6 +295,37 @@ fetch_all() {
     esac
 
     log "model is sharded: ${n} files"
+
+    # Price the whole job before starting it, so the first line of the download
+    # says what it will cost in time rather than leaving you to add up shards
+    # while a 50 GB file looks stuck. Files already in the volume are left out
+    # of the total; a HEAD that does not answer only costs the ETA.
+    local total=0 missing=0 sz
+    i=1
+    while [ "$i" -le "$n" ]; do
+        name="$(printf '%s%05d-of-%05d.gguf' "${first%%[0-9][0-9][0-9][0-9][0-9]-of-*}" "$i" "$n")"
+        if [ ! -e "${MODEL_DIR}/${name}" ]; then
+            sz="$(head_bytes "${MODEL_BASE_URL}/${MODEL_REPO}/resolve/main/${name}")"
+            if [ -n "$sz" ]; then
+                total=$(( total + sz ))
+                missing=$(( missing + 1 ))
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    DL_TOTAL_BYTES="$total"
+    DL_DONE_BYTES=0
+    if [ "$total" -gt 0 ]; then
+        log "to fetch: ${missing} of ${n} files, $(gb "$total") GB total"
+        log "  at 100 MB/s that is $(hms $(( total / 100000000 )) ), at 250 MB/s $(hms $(( total / 250000000 )) )"
+        if [ "$DL_CONNS" -gt 1 ]; then
+            log "  ${DL_CONNS} connections per file (DOWNLOAD_CONNS), progress every ${PROGRESS_INTERVAL}s"
+        else
+            log "  single connection — aria2 missing or DOWNLOAD_CONNS=1; expect HF to shape it"
+        fi
+    fi
+
     i=1
     while [ "$i" -le "$n" ]; do
         name="$(printf '%s%05d-of-%05d.gguf' "${first%%[0-9][0-9][0-9][0-9][0-9]-of-*}" "$i" "$n")"

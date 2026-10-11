@@ -23,6 +23,13 @@ RUN apt-get update
 
 RUN apt-get install -y --no-install-recommends ca-certificates curl tar libgomp1 libcurl4 jq unzip zstd
 
+# aria2 downloads one file over many connections. HF's CDN shapes per
+# connection, so a single curl stream tops out around 50-200 MB/s however fat
+# the link is, and a quant is 87-272 GiB over 3-7 shards. On a rented GPU every
+# minute of that is billed at the full card rate, so the connections pay for
+# themselves on the first boot. curl stays as the fallback.
+RUN apt-get install -y --no-install-recommends aria2
+
 RUN apt-get install -y --no-install-recommends nginx libnginx-mod-http-js
 
 RUN rm -rf /var/lib/apt/lists/*
@@ -99,6 +106,12 @@ ENV FIT_MARGIN_MIB=4096
 # fill the volume. A full filesystem does not just fail the download, it stops
 # everything on the host that needs to write, sshd included.
 ENV DISK_RESERVE_MIB=8192
+# Connections per file when aria2 is available. HF shapes per connection, so
+# this is what turns a 7 Gbit/s link into 7 Gbit/s of download. 1 forces the
+# single-stream curl path.
+ENV DOWNLOAD_CONNS=16
+# Seconds between download progress lines. 0 silences them.
+ENV PROGRESS_INTERVAL=30
 # A number, or 'auto' to drop --ctx-size and let llama.cpp's own fitter size the
 # KV pool against free VRAM. Ignored when AUTO_SCALE=1 picks a value.
 # 131072 is the floor autoscale.sh sizes the quant around, not a target: it picks
