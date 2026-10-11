@@ -366,55 +366,82 @@ and `q8_0` if that is what makes that quant fit.
 
 **128K is a floor, not a target.** The context never shrinks — the quant is what flexes.
 
-| Quant | Shards | Weights | Min VRAM, f16 KV | Min VRAM, q8_0 KV |
+| Quant | Shards | Weights | Base, q8_0 KV | Base, f16 KV |
 |---|---|---|---|---|
-| `UD-Q6_K_XL` | 7 | 271.79 GiB | 291712 MiB | 287872 MiB |
-| `UD-Q5_K_XL` | 6 | 223.80 GiB | 242572 MiB | 238732 MiB |
-| `UD-Q4_K_XL` | 6 | 185.99 GiB | 203854 MiB | 200014 MiB |
-| `UD-IQ4_XS` | 5 | 146.05 GiB | 162955 MiB | 159115 MiB |
-| `UD-Q3_K_XL` | 4 | 137.40 GiB | 154099 MiB | 150259 MiB |
-| **`UD-IQ3_XXS`** | 4 | **112.10 GiB** | **128189 MiB** | **124349 MiB** |
-| `UD-Q2_K_XL` | 4 | 101.25 GiB | 117082 MiB | 113242 MiB |
-| `UD-IQ2_XXS` | 4 | 94.85 GiB | 110525 MiB | 106685 MiB |
-| `UD-IQ1_M` | 3 | 90.88 GiB | 106457 MiB | 102617 MiB |
-| `UD-IQ1_S` | 3 | 86.69 GiB | 102173 MiB | 98333 MiB |
+| `UD-Q6_K_XL` | 7 | 271.79 GiB | 283776 MiB | 287616 MiB |
+| `UD-Q5_K_XL` | 6 | 223.80 GiB | 234636 MiB | 238476 MiB |
+| `UD-Q4_K_XL` | 6 | 185.99 GiB | 195918 MiB | 199758 MiB |
+| **`UD-IQ4_XS`** | 5 | **146.05 GiB** | **155019 MiB** | **158859 MiB** |
+| `UD-Q3_K_XL` | 4 | 137.40 GiB | 146163 MiB | 150003 MiB |
+| `UD-IQ3_XXS` | 4 | 112.10 GiB | 120253 MiB | 124093 MiB |
+| `UD-Q2_K_XL` | 4 | 101.25 GiB | 109146 MiB | 112986 MiB |
+| `UD-IQ2_XXS` | 4 | 94.85 GiB | 102589 MiB | 106429 MiB |
+| `UD-IQ1_M` | 3 | 90.88 GiB | 98521 MiB | 102361 MiB |
+| `UD-IQ1_S` | 3 | 86.69 GiB | 94237 MiB | 98077 MiB |
 
-Minimums are `weights + FIT_MARGIN_MIB(4096) + mmproj(1110) + 128K of KV`, so **13398 MiB of
-overhead at f16 and 9558 MiB at q8_0**. Drop `ENABLE_VISION` and each figure falls by 1110.
+Those are `weights + 128K of KV + mmproj(1110)`. Drop `ENABLE_VISION` and each falls by 1110.
+
+### The margin is per device, and that is not a detail
+
+On top of the base figure, **every GPU keeps `FIT_MARGIN_MIB` (4096) free** — the same meaning
+llama.cpp gives `--fit-target`. A 2-card host therefore gives up 8192 MiB of its total, a
+4-card host 16384.
+
+This is not bookkeeping. llama.cpp splits **layers** across devices, so a reserve held as one
+pooled number leaves each card a fraction of it, and whichever card also carries the mmproj
+less still. Treating it as a total is how a 163840 MiB host gets handed a quant that needs
+158859: on paper 4981 MiB spare, in reality ~2 GB per card before a single compute buffer is
+allocated, and an abort after the weights are already resident.
 
 The KV numbers are the same ones the qwen image used — **64 MiB per 1024 tokens at f16, 34 MiB
-at q8_0** — which is to say they are measured rather than inferred from this model's layer
-geometry. Overestimating KV costs at most a quant tier; underestimating it costs a failed load.
+at q8_0** — measured rather than inferred from this model's layer geometry. Overestimating KV
+costs at most a quant tier; underestimating it costs a failed load.
+
+`autoscale.sh` takes the biggest quant that holds 128K **with q8_0 KV**, then upgrades that row
+to f16 if f16 also fits. That order matters: a bigger quant at `q8_0` beats a smaller one at
+`f16`, because the KV type costs far less quality than a whole quant step. Trying f16 first did
+the opposite — it spent 3840 MiB on the KV type and then had to drop a quant to pay for it.
 
 What that buys in practice:
 
-| Host | Total VRAM | Picks | KV | Free |
-|---|---|---|---|---|
-| 4x A100-80 | 327680 MiB | `UD-Q6_K_XL` | f16 | 40064 MiB |
-| 2x H200-141 | 288768 MiB | `UD-Q6_K_XL` | **q8_0** | 4992 MiB |
-| 8x RTX 5090 | 260856 MiB | `UD-Q5_K_XL` | f16 | 22380 MiB |
-| 6x RTX 5090 | 195642 MiB | `UD-IQ4_XS` | f16 | 36783 MiB |
-| **2x A100-80** | **163840 MiB** | **`UD-IQ4_XS`** | f16 | 4981 MiB |
-| 1x H200-141 | 144384 MiB | `UD-IQ3_XXS` | f16 | 20291 MiB |
-| **4x RTX 5090** | **130428 MiB** | **`UD-IQ3_XXS`** | f16 | 6335 MiB |
-| 3x RTX 5090 | 97821 MiB | `UD-IQ1_S` | q8_0 | **does not fit** |
+| Host | Total VRAM | Cards | Picks | KV | Free per card |
+|---|---|---|---|---|---|
+| 4x A100-80 | 327680 MiB | 4 | `UD-Q6_K_XL` | f16 | 10016 MiB |
+| 2x H200-141 | 288768 MiB | 2 | `UD-Q5_K_XL` | f16 | 25146 MiB |
+| 8x RTX 5090 | 260856 MiB | 8 | `UD-Q4_K_XL` | f16 | 7637 MiB |
+| **2x A100-80** | **163840 MiB** | 2 | **`UD-IQ4_XS`** | **q8_0** | 4410 MiB |
+| 1x H200-141 | 144384 MiB | 1 | `UD-IQ3_XXS` | f16 | 20291 MiB |
+| 4x RTX 5090 | 130428 MiB | 4 | `UD-Q2_K_XL` | f16 | 4360 MiB |
+| 3x RTX 5090 | 97821 MiB | 3 | `UD-IQ1_S` | q8_0 | **does not fit** |
 
-The 2x H200 row is the whole point of the fallback: dropping KV to `q8_0` frees 3840 MiB, which
-is enough to keep `UD-Q6_K_XL` instead of falling to `UD-Q5_K_XL`. f16 is tried first on every
-quant, so a row only goes to `q8_0` when that is what lets **that** quant fit — a bigger quant
-at `q8_0` always beats a smaller one at `f16`, because the KV type costs far less quality than
-a whole quant step.
-
-**There is a floor, and it is high.** Below 98333 MiB nothing holds 128K at any quant.
-`autoscale.sh` picks `UD-IQ1_S` and says so loudly rather than quietly shrinking your context:
+**There is a floor, and it is high.** Once each card keeps its reserve, 3x RTX 5090 holds
+nothing at 128K. `autoscale.sh` says so loudly rather than quietly shrinking your context:
 
 ```
 [autoscale] WARNING 97821 MiB cannot hold 131072 context at any quant.
-[autoscale]   Smallest is UD-IQ1_S + q8_0 KV = 98333 MiB. Layers will spill to
+[autoscale]   Smallest is UD-IQ1_S + q8_0 KV = 106525 MiB. Layers will spill to
 [autoscale]   host RAM; drop N_GPU_LAYERS, lower CTX_TARGET, or rent more VRAM.
 ```
 
-That is 3x RTX 5090 missing it by 512 MiB. Four cards is the real entry point.
+### When the table is still wrong
+
+A table cannot measure compute buffers, and llama.cpp's own fitter — which can — refuses to run
+when `--n-gpu-layers` is passed explicitly (`n_gpu_layers already set by user to 99, abort`),
+which this image does. So the estimate can still be optimistic.
+
+The entrypoint therefore does not strand the host on a bad guess. If `llama-server` exits
+within `GRACE_SECONDS` (180), it is restarted on the **same weights** with:
+
+1. `q8_0` KV at full context
+2. `q8_0` KV at half context
+3. `q8_0` KV at a quarter
+
+Nothing is re-downloaded — a retry costs seconds, not another 150 GB. If it stayed up past the
+grace period and then exited, that is a real crash, not a sizing problem, and it is not retried.
+When every rung fails the entrypoint stops nginx too, so the container exits instead of serving
+`/manage/` and a permanent 502 while looking alive.
+
+Four cards is the real entry point.
 
 The logic lives in `docker/autoscale.sh`, not buried in the entrypoint, so you can ask it what
 it would do without starting anything:
@@ -477,6 +504,12 @@ pool itself — `fit_params` is **on by default** (`common/common.h:481`) and re
 accurate than any table here, and on this model that is worth more than it was on the qwen
 image: 320B of MoE weights needs far more per-device scratch than a 27B dense model, which is
 why `FIT_MARGIN_MIB` defaults to 4096 rather than llama.cpp's stock 1024.
+
+Note the catch: that fitter **declines to run when `--n-gpu-layers` is passed**, and this image
+passes it (`N_GPU_LAYERS=99`). The log says so plainly — `common_fit_params: failed to fit
+params to free device memory: n_gpu_layers already set by user to 99, abort`. So on a normal
+boot nothing measures the real buffers, and `autoscale.sh`'s table is the only estimate in
+play. That is why the per-device margin and the entrypoint's step-down ladder both exist.
 
 ## Pick the quant
 

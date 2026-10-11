@@ -15,10 +15,18 @@ set -euo pipefail
 say() { printf '[autoscale] %s\n' "$*" >&2; }
 
 ENABLE_VISION="${ENABLE_VISION:-0}"
-# 320B of MoE weights needs far more scratch than a 27B dense model did: the
-# per-device compute buffers at long context are the reason this default is 4x
-# the llama.cpp stock 1024.
+# PER DEVICE, not a total — same meaning as llama.cpp's --fit-target, which the
+# entrypoint hands the same number. 320B of MoE weights needs far more scratch
+# than a 27B dense model did, which is why this is 4x the llama.cpp stock 1024.
+#
+# This is per device because llama.cpp splits LAYERS across GPUs: on a 2-card
+# host a total-based reserve leaves each card half of it, and whichever card
+# holds the mmproj less still. Getting that wrong is a load that dies after the
+# weights are already on the cards.
 FIT_MARGIN_MIB="${FIT_MARGIN_MIB:-4096}"
+# How many devices that margin is multiplied by. Detected from nvidia-smi;
+# override when deciding for a host you are not on (with VRAM_MIB).
+N_DEVICES="${N_DEVICES:-}"
 MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_PREFIX="${MODEL_PREFIX:-GLM-5.3-Flash}"
 MMPROJ_MIB=1110
@@ -47,6 +55,12 @@ detect_vram_mib() {
         | awk '{ t += $1 + 0 } END { if (t > 0) print int(t); else exit 1 }'
 }
 
+detect_device_count() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+        | awk 'NF { n++ } END { if (n > 0) print n; else exit 1 }'
+}
+
 # Every quant of this model, largest first, with the real totals from the
 # Unsloth repo summed over every shard of that quant (the 00001 shard is a
 # ~9 MiB index, the rest carry the tensors). Sizes in GiB, for reading against
@@ -72,20 +86,23 @@ UD-Q6_K_XL:7:278314
  UD-IQ1_S:3:88775"
 
 # What one row costs on top of its weights, for a given KV type.
+#
+# The margin is multiplied by the device count: a 2-card host must keep
+# FIT_MARGIN_MIB free on EACH card, so 2x that much of the total is unusable.
 overhead_mib() {
     local per_1k="$1"
-    local o=$(( FIT_MARGIN_MIB + (CTX_TARGET / 1024) * per_1k ))
+    local o=$(( FIT_MARGIN_MIB * N_DEVICES + (CTX_TARGET / 1024) * per_1k ))
     [ "$ENABLE_VISION" = "1" ] && o=$(( o + MMPROJ_MIB ))
     printf '%s' "$o"
 }
 
 # Sets MODEL_FILE / CACHE_TYPE / CTX_SIZE from $1 = total VRAM in MiB.
 #
-# Walks the quants largest-first and takes the first that holds CTX_TARGET.
-# f16 is tried before q8_0 on each quant, so a row only drops to q8_0 when that
-# is what lets THAT quant fit — which means a bigger quant at q8_0 always wins
-# over a smaller one at f16. That is the right way round: the KV type costs far
-# less quality than a whole quant step does.
+# Walks the quants largest-first and takes the first that holds CTX_TARGET with
+# q8_0 KV, then upgrades that row to f16 if f16 ALSO fits. Deliberately this way
+# round: the KV type costs far less quality than a whole quant step, so a bigger
+# quant at q8_0 beats a smaller one at f16. Trying f16 first did the opposite —
+# it spent 3840 MiB of headroom on the KV type and then had to drop a quant.
 pick_for_vram() {
     local vram_mib="$1"
     local o_f16 o_q8 row quant shards weights_mib
@@ -98,15 +115,16 @@ pick_for_vram() {
         local rest="${row#*:}"
         local sh="${rest%%:*}"
         local w="${rest#*:}"
-        if [ $(( w + o_f16 )) -le "$vram_mib" ]; then
-            quant="$q"; shards="$sh"; weights_mib="$w"; CACHE_TYPE=f16
-            MIN_MIB=$(( w + o_f16 ))
-            break
-        fi
         if [ $(( w + o_q8 )) -le "$vram_mib" ]; then
-            quant="$q"; shards="$sh"; weights_mib="$w"; CACHE_TYPE=q8_0
-            MIN_MIB=$(( w + o_q8 ))
-            say "${q} needs q8_0 KV to hold ${CTX_TARGET} in ${vram_mib} MiB"
+            quant="$q"; shards="$sh"; weights_mib="$w"
+            if [ $(( w + o_f16 )) -le "$vram_mib" ]; then
+                CACHE_TYPE=f16
+                MIN_MIB=$(( w + o_f16 ))
+            else
+                CACHE_TYPE=q8_0
+                MIN_MIB=$(( w + o_q8 ))
+                say "${q} needs q8_0 KV to hold ${CTX_TARGET} in ${vram_mib} MiB"
+            fi
             break
         fi
     done
@@ -163,6 +181,11 @@ if [ -z "$VRAM_MIB" ]; then
     VRAM_MIB="$(detect_vram_mib)" || { say "no nvidia-smi and no VRAM_MIB; nothing to decide"; exit 1; }
 fi
 
+if [ -z "$N_DEVICES" ]; then
+    N_DEVICES="$(detect_device_count)" || N_DEVICES=1
+fi
+[ "$N_DEVICES" -ge 1 ] 2>/dev/null || N_DEVICES=1
+
 pick_for_vram "$VRAM_MIB"
 SOURCE=table
 
@@ -176,10 +199,23 @@ kv_mib=$(( CTX_SIZE / 1024 * per_1k ))
 used_mib=$(( WEIGHTS_MIB + kv_mib ))
 [ "$ENABLE_VISION" = "1" ] && used_mib=$(( used_mib + MMPROJ_MIB ))
 
-say "${VRAM_MIB} MiB -> ${MODEL_QUANT} (${MODEL_SHARDS} shards) + ${CTX_SIZE} ctx @ ${CACHE_TYPE} KV, needs ${TIER} GiB"
-say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + mmproj $([ "$ENABLE_VISION" = "1" ] && echo $MMPROJ_MIB || echo 0) MiB = ${used_mib} MiB, $(( VRAM_MIB - used_mib )) MiB free"
+free_mib=$(( VRAM_MIB - used_mib ))
+free_per_dev=$(( free_mib / N_DEVICES ))
+
+say "${VRAM_MIB} MiB over ${N_DEVICES} device(s) -> ${MODEL_QUANT} (${MODEL_SHARDS} shards) + ${CTX_SIZE} ctx @ ${CACHE_TYPE} KV, needs ${TIER} GiB"
+say "  weights ${WEIGHTS_MIB} MiB + kv ${kv_mib} MiB + mmproj $([ "$ENABLE_VISION" = "1" ] && echo $MMPROJ_MIB || echo 0) MiB = ${used_mib} MiB"
+say "  free ${free_mib} MiB total = ~${free_per_dev} MiB per device (reserve ${FIT_MARGIN_MIB}/device)"
+
+# llama.cpp splits LAYERS, so what matters is the per-device figure. Anything
+# under the reserve means the compute buffers have nowhere to go and the load
+# dies after the weights are already on the cards.
+if [ "$free_per_dev" -lt "$FIT_MARGIN_MIB" ]; then
+    say "WARNING only ${free_per_dev} MiB free per device, under the ${FIT_MARGIN_MIB} MiB reserve."
+    say "  Raise FIT_MARGIN_MIB, lower CTX_TARGET, or expect an out-of-memory abort."
+fi
 
 printf 'VRAM_MIB=%s\n'     "$VRAM_MIB"
+printf 'N_DEVICES=%s\n'    "$N_DEVICES"
 printf 'TIER=%s\n'         "$TIER"
 printf 'MODEL_FILE=%s\n'   "$MODEL_FILE"
 printf 'MODEL_QUANT=%s\n'  "$MODEL_QUANT"

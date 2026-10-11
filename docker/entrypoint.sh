@@ -158,18 +158,22 @@ args=(
 # the KV pool to free device memory, keeping --fit-target MiB (1024 by default)
 # in reserve. It measures compute buffers instead of estimating them, so it
 # beats any table here — but it only adjusts arguments we do not pass.
+ctx_args=()
 if [ "${CTX_SIZE}" != "auto" ]; then
-    args+=(--ctx-size "$CTX_SIZE")
+    ctx_args=(--ctx-size "$CTX_SIZE")
 else
-    log "ctx: delegated to llama.cpp --fit (margin $(( FIT_MARGIN_MIB )) MiB)"
-    args+=(--fit-target "$FIT_MARGIN_MIB")
+    log "ctx: delegated to llama.cpp --fit (margin $(( FIT_MARGIN_MIB )) MiB per device)"
+    ctx_args=(--fit-target "$FIT_MARGIN_MIB")
 fi
 
 # Only set by auto-scale, and never over an explicit choice the user made.
+kv_args=()
+KV_IS_OURS=0
 if [ -n "$AS_KV" ] \
    && [ -z "${LLAMA_ARG_CACHE_TYPE_K:-}" ] \
    && [[ "${EXTRA_ARGS}" != *--cache-type-k* ]]; then
-    args+=(--cache-type-k "$AS_KV" --cache-type-v "$AS_KV")
+    kv_args=(--cache-type-k "$AS_KV" --cache-type-v "$AS_KV")
+    KV_IS_OURS=1
 fi
 
 # Left empty, llama.cpp picks its own thread count.
@@ -249,6 +253,77 @@ if [ -n "${EXTRA_ARGS}" ]; then
     args+=(${EXTRA_ARGS})
 fi
 
-# Anything passed to `podman run <image> ...` is appended verbatim.
-log "llama-server ${args[*]} $*"
-exec /app/bin/llama-server "${args[@]}" "$@"
+# --- start, and step down rather than strand the host -----------------------
+# A table cannot measure compute buffers, so a load can still run out of device
+# memory after the weights are already on the cards. Everything below re-runs on
+# the SAME weights — only the KV type and the context shrink, so a retry costs
+# seconds, never another download.
+#
+# Each rung is tried in order; the first that stays up past GRACE_SECONDS is the
+# one we keep. Anything passed to `podman run <image> ...` is appended verbatim.
+GRACE_SECONDS="${GRACE_SECONDS:-180}"
+
+ladder=()
+if [ "$KV_IS_OURS" = "1" ] && [ "${CTX_SIZE}" != "auto" ]; then
+    # "<kv>:<ctx>". Drop the KV type first, then halve the context twice: q8_0 at
+    # full context beats f16 at a quarter of it.
+    [ "$AS_KV" != "q8_0" ] && ladder+=("q8_0:${CTX_SIZE}")
+    ladder+=("q8_0:$(( CTX_SIZE / 2 ))")
+    ladder+=("q8_0:$(( CTX_SIZE / 4 ))")
+fi
+
+run_llama() {
+    local started ran rc
+    log "llama-server ${*}"
+    started="$(date +%s)"
+    set +e
+    /app/bin/llama-server "$@"
+    rc=$?
+    set -e
+    ran=$(( $(date +%s) - started ))
+    LAST_RAN="$ran"
+    return "$rc"
+}
+
+attempt_args=("${args[@]}" "${ctx_args[@]}" "${kv_args[@]}" "$@")
+
+if run_llama "${attempt_args[@]}"; then
+    exit 0
+fi
+
+for rung in "${ladder[@]}"; do
+    # Served for a while and then stopped: that is not a sizing problem, and
+    # retrying smaller would hide a real crash.
+    if [ "${LAST_RAN:-0}" -ge "$GRACE_SECONDS" ]; then
+        log "llama-server ran ${LAST_RAN}s before exiting — not a fit problem, not retrying"
+        break
+    fi
+
+    kv="${rung%%:*}"
+    ctx="${rung#*:}"
+    log ""
+    log "llama-server died after ${LAST_RAN}s. Stepping down: KV ${kv}, ctx ${ctx}."
+    log "  Same weights, nothing re-downloaded. Set CTX_TARGET or FIT_MARGIN_MIB"
+    log "  to pick this directly next boot and skip the failed attempt."
+
+    attempt_args=("${args[@]}" --ctx-size "$ctx" --cache-type-k "$kv" --cache-type-v "$kv" "$@")
+    if run_llama "${attempt_args[@]}"; then
+        exit 0
+    fi
+done
+
+log ""
+log "FAILED llama-server will not stay up at any size this script can try."
+log "  Last run lasted ${LAST_RAN:-0}s. Look above this line for the real error:"
+log "    cudaMalloc failed      -> out of device memory, lower CTX_TARGET"
+log "    killed with no message -> host RAM, the kernel OOM killer took it"
+log "    tensor/shard errors    -> a truncated download, delete ${MODEL_DIR} and retry"
+
+# Stop nginx too. Left running it would keep answering /manage/ and returning
+# 502 on /, so the container looks alive while nothing can ever serve a token.
+if [ "${GATEWAY_ENABLE:-1}" = "1" ]; then
+    log "stopping nginx so this container exits instead of serving 502 forever"
+    nginx -s stop 2>/dev/null || pkill -x nginx 2>/dev/null || true
+fi
+
+exit 1

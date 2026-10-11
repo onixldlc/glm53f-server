@@ -87,9 +87,11 @@ ENV MODEL_DIR=/models
 ENV AUTO_SCALE=1
 # VRAM to assume instead of asking nvidia-smi, in MiB. Empty = detect.
 ENV VRAM_MIB=
-# Headroom left free on each device, in MiB. Matches llama.cpp's --fit-target.
-# 320B of MoE weights needs far more scratch than a 27B dense model: 4x the
-# llama.cpp stock 1024. autoscale.sh assumes this same number.
+# Headroom left free on each device, in MiB — PER DEVICE, the same meaning
+# llama.cpp gives --fit-target, which is handed this number. 320B of MoE weights
+# needs far more scratch than a 27B dense model: 4x the llama.cpp stock 1024.
+# autoscale.sh multiplies it by the GPU count, because llama.cpp splits LAYERS
+# across devices and every card needs its own room for compute buffers.
 ENV FIT_MARGIN_MIB=4096
 # A number, or 'auto' to drop --ctx-size and let llama.cpp's own fitter size the
 # KV pool against free VRAM. Ignored when AUTO_SCALE=1 picks a value.
